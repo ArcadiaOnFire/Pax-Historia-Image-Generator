@@ -1,0 +1,127 @@
+
+Tampermonkey® by Jan Biniok
+v5.5.0
+	
+Pax Historia Image Gen
+
+1
+
+// ==UserScript==
+
+2
+
+// @name         Pax Historia Image Gen
+
+3
+
+// @match        https://paxhistoria.co/*
+
+4
+
+// @match        https://www.paxhistoria.co/*
+
+5
+
+// @grant        GM_xmlhttpRequest
+
+6
+
+// @connect      127.0.0.1
+
+7
+
+// @run-at       document-end
+
+8
+
+// ==/UserScript==
+
+9
+
+​
+
+10
+
+(function () {
+
+11
+
+'use strict';
+
+12
+
+​
+
+13
+
+const STATE = {
+
+14
+
+    engine: "ComfyUI",
+
+15
+
+    host: "http://127.0.0.1:8188",
+
+16
+
+    activeWorkflow: null,
+
+17
+
+    workflows: {}
+
+18
+
+};
+
+19
+
+​
+
+20
+
+const processed = new Set();
+
+21
+
+const BTN_ID = "ph-img-gen-btn";
+
+22
+
+const MODAL_ID = "ph-img-modal";
+
+23
+
+const VIEW_ID = "ph-img-viewer";
+
+24
+
+const PREVIEW_CLASS = "ph-img-inline";
+
+25
+
+​
+
+26
+
+function save() {
+
+27
+
+    localStorage.setItem("ph_img_state", JSON.stringify(STATE));
+
+28
+
+}
+
+29
+
+​
+
+Please enable anonymous statistics and help optimize this extension. Only technical and extension interaction data is collected. Click here for more info about the data.Operation completed successfully
+Tam - Your service bot
+Do you need help viewing and editing values stored by a userscript?
+Disable
+Tampermonkey Bot
