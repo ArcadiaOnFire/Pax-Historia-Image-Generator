@@ -41,7 +41,7 @@ function $(q) {
 }
 
 function getRef() {
-    return $("#ph-ai-indicator");
+    return document.querySelector('nav li:has(a[href="/games"])');
 }
 
 function ensureButton() {
