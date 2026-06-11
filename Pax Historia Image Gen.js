@@ -161,18 +161,47 @@ function buildPrompt(action) {
 
     const visual = compressAction(action.body);
 
+    // =========================
+    // HARD LIMIT FACTIONS
+    // =========================
+    let factions = action.factions || [];
+
+    // remove extremely abstract / problematic entities
+    const blacklist = new Set([
+        "God",
+        "god",
+        "GOD"
+    ]);
+
+    factions = factions
+        .filter(f => !blacklist.has(f))
+        .slice(0, 4); // HARD CAP
+
+    const factionText = factions.length
+        ? factions.join(", ") + "."
+        : "";
+
+    // =========================
+    // CLEAN TITLE
+    // =========================
+    const title = (action.title || "")
+        .replace(/['"]/g, "")
+        .slice(0, 120);
+
+    // =========================
+    // FINAL PROMPT (STABILIZED)
+    // =========================
     return [
         action.date ? action.date + "." : "",
-        action.factions?.length ? action.factions.join(", ") + "." : "",
-        action.title ? action.title + "." : "",
+        factionText,
+        title,
         visual,
 
         "",
         "cinematic wide shot",
-        "post-apocalyptic wasteland",
-        "environmental storytelling",
+        "realistic environment",
         "high detail",
-        "realistic lighting"
+        "soft natural lighting"
     ]
     .filter(Boolean)
     .join("\n");
@@ -192,10 +221,46 @@ function buildWorkflow(action) {
     console.log(prompt);
     console.log("======================");
 
-    // IMPORTANT FIX: target ONLY the real FLUX prompt node
-    if (wf["6"]?.inputs?.text !== undefined) {
-        wf["6"].inputs.text = prompt;
+    // =========================
+    // FIX: FIND *REAL POSITIVE PROMPT*
+    // =========================
+
+    let targetNode = null;
+
+    for (const [id, node] of Object.entries(wf)) {
+        if (!node?.class_type) continue;
+
+        if (node.class_type === "CLIPTextEncode" && node.inputs) {
+
+            const text = node.inputs.text;
+
+            // 🔥 KEY FIX:
+            // Negative prompts usually contain "negative" keywords OR are short boilerplate
+            const isLikelyPositive =
+                typeof text === "string" &&
+                text.length > 20 &&
+                !text.toLowerCase().includes("negative");
+
+            if (isLikelyPositive) {
+                targetNode = node;
+                break;
+            }
+        }
     }
+
+    // Fallback (your old behavior)
+    if (!targetNode && wf["6"]?.inputs?.text !== undefined) {
+        targetNode = wf["6"];
+    }
+
+    if (!targetNode) {
+        console.warn("No valid prompt node found");
+        return null;
+    }
+
+    console.log("USING NODE:", targetNode);
+
+    targetNode.inputs.text = prompt;
 
     return wf;
 }
@@ -233,6 +298,20 @@ function pollResult(promptId) {
                     try {
                         const data = JSON.parse(r.responseText);
                         const entry = data?.[promptId];
+
+                        // =========================
+                        // HARD FAILURE DETECTION
+                        // =========================
+                        if (!entry) return;
+
+                        const status = entry?.status?.status_str;
+
+                        if (status === "error" || status === "canceled") {
+                            clearInterval(t);
+                            reject("ComfyUI execution failed");
+                            return;
+                        }
+
                         const outputs = entry?.outputs;
 
                         if (outputs) {
@@ -241,18 +320,21 @@ function pollResult(promptId) {
                                 if (imgs?.length) {
                                     clearInterval(t);
                                     const img = imgs[0];
-                                    resolve(`${STATE.host}/view?filename=${img.filename}&subfolder=${img.subfolder}&type=${img.type}`);
+                                    resolve(
+                                        `${STATE.host}/view?filename=${img.filename}&subfolder=${img.subfolder}&type=${img.type}`
+                                    );
                                     return;
                                 }
                             }
                         }
+
                     } catch {}
                 }
             });
 
             if (tries > 60) {
                 clearInterval(t);
-                reject("timeout");
+                reject("timeout (no outputs produced)");
             }
         }, 2000);
     });
