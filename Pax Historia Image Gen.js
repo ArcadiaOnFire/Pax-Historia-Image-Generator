@@ -39,6 +39,18 @@ const BTN_ID = "ph-img-gen-btn";
 const MODAL_ID = "ph-img-modal";
 const VIEW_ID = "ph-img-viewer";
 const PREVIEW_CLASS = "ph-img-inline";
+const STOP_BTN_ID = "ph-img-stop-btn";
+
+const activeRequests = new Set();
+const activePollCancels = new Set();
+const objectUrls = new Set();
+
+let stopRequested = false;
+let observer = null;
+let processRunning = false;
+let processQueued = false;
+let processTimer = null;
+let openRouterCooldownUntil = 0;
 
 function mergeDeep(target, source) {
     for (const key of Object.keys(source || {})) {
@@ -58,6 +70,7 @@ function mergeDeep(target, source) {
 function normalizeState() {
     if (!STATE.textAI) STATE.textAI = { provider: null, openrouter: {}, openaiCompatible: {} };
     if (STATE.textAI.provider === "disabled") STATE.textAI.provider = null;
+
     if (STATE.textAI.provider === "lmstudio" || STATE.textAI.provider === "oobabooga") {
         const legacy = STATE.textAI.provider === "lmstudio" ? STATE.textAI.lmstudio : STATE.textAI.oobabooga;
         if (!STATE.textAI.openaiCompatible) {
@@ -72,12 +85,14 @@ function normalizeState() {
         if (legacy && legacy.apiKey) STATE.textAI.openaiCompatible.apiKey = legacy.apiKey;
         STATE.textAI.provider = "openai-compatible";
     }
+
     if (!STATE.textAI.openrouter) {
         STATE.textAI.openrouter = {
             apiKey: "",
             model: "openai/gpt-4o-mini"
         };
     }
+
     if (!STATE.textAI.openaiCompatible) {
         STATE.textAI.openaiCompatible = {
             endpoint: "http://127.0.0.1:1234/v1/chat/completions",
@@ -113,7 +128,12 @@ function getRef() {
 function ensureButton() {
     const ref = getRef();
     if (!ref) return;
-    if ($("#" + BTN_ID)) return;
+
+    const existing = $("#" + BTN_ID);
+    if (existing) {
+        existing.innerText = `IMAGE GENERATION | ${STATE.engine}`;
+        return;
+    }
 
     const b = document.createElement("button");
     b.id = BTN_ID;
@@ -148,9 +168,164 @@ function getActions() {
     return Array.from(document.querySelectorAll(".animate-in.fade-in.slide-in-from-top-4"));
 }
 
-/* =========================
-   EXTRACT (UNCHANGED LOGIC)
-========================= */
+function isStopped() {
+    return stopRequested;
+}
+
+function makeRequest(options) {
+    return new Promise((resolve, reject) => {
+        if (stopRequested) {
+            reject(new Error("stopped"));
+            return;
+        }
+
+        let settled = false;
+        let req = null;
+
+        const cleanup = () => {
+            if (req && typeof req.abort === "function") {
+                activeRequests.delete(req);
+            }
+        };
+
+        const finishResolve = (value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+        };
+
+        const finishReject = (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+        };
+
+        req = GM_xmlhttpRequest({
+            ...options,
+            onload: r => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                if (typeof options.onload === "function") {
+                    try {
+                        const value = options.onload(r);
+                        finishResolve(value === undefined ? r : value);
+                    } catch (e) {
+                        finishReject(e);
+                    }
+                } else {
+                    finishResolve(r);
+                }
+            },
+            onerror: e => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                if (typeof options.onerror === "function") {
+                    try {
+                        const value = options.onerror(e);
+                        finishResolve(value === undefined ? e : value);
+                    } catch (err) {
+                        finishReject(err);
+                    }
+                } else {
+                    finishReject(e);
+                }
+            },
+            ontimeout: e => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                if (typeof options.ontimeout === "function") {
+                    try {
+                        const value = options.ontimeout(e);
+                        finishResolve(value === undefined ? e : value);
+                    } catch (err) {
+                        finishReject(err);
+                    }
+                } else {
+                    finishReject(new Error("timeout"));
+                }
+            },
+            onabort: () => {
+                finishReject(new Error("stopped"));
+            }
+        });
+
+        if (req && typeof req.abort === "function") {
+            activeRequests.add(req);
+        }
+    });
+}
+
+function getResponseHeader(responseHeaders, name) {
+    const lines = String(responseHeaders || "").split(/\r?\n/);
+    const wanted = name.toLowerCase();
+
+    for (const line of lines) {
+        const idx = line.indexOf(":");
+        if (idx === -1) continue;
+
+        const k = line.slice(0, idx).trim().toLowerCase();
+        const v = line.slice(idx + 1).trim();
+
+        if (k === wanted) return v;
+    }
+
+    return "";
+}
+
+function stopAllRequests() {
+    stopRequested = true;
+
+    for (const req of Array.from(activeRequests)) {
+        try {
+            req.abort();
+        } catch {}
+    }
+    activeRequests.clear();
+
+    for (const cancel of Array.from(activePollCancels)) {
+        try {
+            cancel();
+        } catch {}
+    }
+    activePollCancels.clear();
+
+    for (const u of Array.from(objectUrls)) {
+        try {
+            URL.revokeObjectURL(u);
+        } catch {}
+    }
+    objectUrls.clear();
+
+    if (observer) {
+        try {
+            observer.disconnect();
+        } catch {}
+    }
+
+    const btn = $("#" + STOP_BTN_ID);
+    if (btn) {
+        btn.textContent = "STOPPED";
+        btn.disabled = true;
+        btn.style.opacity = "0.75";
+        btn.style.cursor = "not-allowed";
+    }
+}
+
+function resetStopState() {
+    stopRequested = false;
+    const btn = $("#" + STOP_BTN_ID);
+    if (btn) {
+        btn.textContent = "STOP";
+        btn.disabled = false;
+        btn.style.opacity = "";
+        btn.style.cursor = "";
+    }
+    if (observer) {
+        try {
+            observer.observe(document.body, { childList: true, subtree: true });
+        } catch {}
+    }
+}
+
 function extract(card) {
     const date =
         card.querySelector(".inline-flex.items-center.rounded-md")
@@ -186,9 +361,6 @@ function safeClone(obj) {
     }
 }
 
-/* =========================
-   WORKFLOW PROMPT HINTS
-========================= */
 function extractWorkflowPromptHints(workflow) {
     const positives = [];
     const negatives = [];
@@ -213,9 +385,6 @@ function extractWorkflowPromptHints(workflow) {
     };
 }
 
-/* =========================
-   PROMPT CLEANING
-========================= */
 function compressAction(body) {
     if (!body) return "";
 
@@ -239,16 +408,12 @@ function compressAction(body) {
         ) continue;
 
         visual.push(s);
-
         if (visual.length >= 2) break;
     }
 
     return visual.join(" ");
 }
 
-/* =========================
-   CONTEXTUAL TAG INFERENCE
-========================= */
 function hasLikelyHumanCue(action) {
     const text = `${action?.title || ""} ${action?.body || ""} ${(action?.factions || []).join(" ")}`;
 
@@ -329,9 +494,6 @@ function inferContextualTags(action) {
     return [...new Set(tags)];
 }
 
-/* =========================
-   TEXT AI LAYER
-========================= */
 function buildTextAIPrompt(action, hints) {
     const positiveTags = hints?.positivePrompt || "";
     const negativeTags = hints?.negativePrompt || "";
@@ -459,90 +621,96 @@ ${positiveTags ? `\nImportant: preserve these exact positive tags verbatim somew
 `;
 }
 
-function callOpenRouter(prompt) {
+async function callOpenRouter(prompt) {
     const cfg = STATE.textAI.openrouter;
 
     if (!cfg.apiKey) throw new Error("Missing OpenRouter API key");
 
-    return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: "https://openrouter.ai/api/v1/chat/completions",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${cfg.apiKey}`,
-                "HTTP-Referer": location.origin,
-                "X-Title": "Pax Historia Image Gen"
-            },
-            data: JSON.stringify({
-                model: cfg.model,
-                messages: [
-                    {
-                        role: "system",
-                        content: "You return JSON only."
-                    },
-                    {
-                        role: "user",
-                        content: prompt
-                    }
-                ],
-                temperature: 0.4
-            }),
-            onload: r => {
-                try {
-                    const data = JSON.parse(r.responseText);
-                    resolve(data.choices?.[0]?.message?.content || "");
-                } catch (e) {
-                    reject(e);
+    const now = Date.now();
+    if (openRouterCooldownUntil && now < openRouterCooldownUntil) {
+        throw new Error(`OpenRouter cooldown active for ${Math.ceil((openRouterCooldownUntil - now) / 1000)}s`);
+    }
+
+    const r = await makeRequest({
+        method: "POST",
+        url: "https://openrouter.ai/api/v1/chat/completions",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${cfg.apiKey}`,
+            "HTTP-Referer": location.origin,
+            "X-Title": "Pax Historia Image Gen"
+        },
+        data: JSON.stringify({
+            model: cfg.model,
+            messages: [
+                {
+                    role: "system",
+                    content: "You return JSON only."
+                },
+                {
+                    role: "user",
+                    content: prompt
                 }
-            },
-            onerror: reject
-        });
+            ],
+            temperature: 0.4
+        }),
+        timeout: 30000
     });
+
+    if (r.status === 429) {
+        const retryAfter = parseInt(getResponseHeader(r.responseHeaders, "retry-after"), 10);
+        const cooldownMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 45000;
+        openRouterCooldownUntil = Date.now() + cooldownMs;
+        throw new Error(`OpenRouter 429 rate limited; cooling down for ${Math.ceil(cooldownMs / 1000)}s`);
+    }
+
+    if (r.status < 200 || r.status >= 300) {
+        throw new Error(`OpenRouter HTTP ${r.status}: ${String(r.responseText || "").slice(0, 300)}`);
+    }
+
+    const data = JSON.parse(r.responseText || "{}");
+    return data.choices?.[0]?.message?.content || "";
 }
 
-function callOpenAICompatible(prompt) {
+async function callOpenAICompatible(prompt) {
     const cfg = STATE.textAI.openaiCompatible;
     const endpoint = normalizeCompatibleEndpoint(cfg.endpoint);
 
-    return new Promise((resolve, reject) => {
-        const headers = {
-            "Content-Type": "application/json"
-        };
+    const headers = {
+        "Content-Type": "application/json"
+    };
 
-        if (cfg.apiKey) {
-            headers.Authorization = `Bearer ${cfg.apiKey}`;
-        }
+    if (cfg.apiKey) {
+        headers.Authorization = `Bearer ${cfg.apiKey}`;
+    }
 
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: endpoint,
-            headers,
-            data: JSON.stringify({
-                model: cfg.model,
-                messages: [
-                    {
-                        role: "system",
-                        content: "You return JSON only."
-                    },
-                    {
-                        role: "user",
-                        content: prompt
-                    }
-                ],
-                temperature: 0.4
-            }),
-            onload: r => {
-                try {
-                    const data = JSON.parse(r.responseText);
-                    resolve(data.choices?.[0]?.message?.content || "");
-                } catch (e) {
-                    reject(e);
+    const r = await makeRequest({
+        method: "POST",
+        url: endpoint,
+        headers,
+        data: JSON.stringify({
+            model: cfg.model,
+            messages: [
+                {
+                    role: "system",
+                    content: "You return JSON only."
+                },
+                {
+                    role: "user",
+                    content: prompt
                 }
-            },
-            onerror: reject
-        });
+            ],
+            temperature: 0.4
+        }),
+        timeout: 30000
     });
+
+    if (r.status < 200 || r.status >= 300) {
+        throw new Error(`OpenAI-compatible HTTP ${r.status}: ${String(r.responseText || "").slice(0, 300)}`);
+    }
+
+    const data = JSON.parse(r.responseText || "{}");
+    return data.choices?.[0]?.message?.content || "";
 }
 
 function normalizeCompatibleEndpoint(endpoint) {
@@ -567,6 +735,7 @@ function extractJSONObject(text) {
 }
 
 async function refineActionWithTextAI(action, hints) {
+    if (stopRequested) return action;
     if (!STATE.textAI.provider) return action;
 
     const prompt = buildTextAIPrompt(action, hints);
@@ -582,25 +751,26 @@ async function refineActionWithTextAI(action, hints) {
             return action;
         }
 
+        if (stopRequested) return action;
+
         const cleaned = extractJSONObject(raw);
         const parsed = JSON.parse(cleaned);
 
         return {
             ...action,
             title: parsed.title || action.title,
-            factions: parsed.factions || action.factions,
+            factions: Array.isArray(parsed.factions) ? parsed.factions : action.factions,
             body: parsed.prompt || action.body
         };
 
     } catch (e) {
-        console.warn("Text AI failed, fallback to raw action", e);
+        if (!stopRequested) {
+            console.warn("Text AI failed, fallback to raw action:", e);
+        }
         return action;
     }
 }
 
-/* =========================
-   FLUX PROMPT BUILDER
-========================= */
 function buildPrompt(action, hints) {
     const visual = compressAction(action.body);
 
@@ -640,9 +810,6 @@ function buildPrompt(action, hints) {
     .join("\n");
 }
 
-/* =========================
-   WORKFLOW INJECTION
-========================= */
 function buildWorkflow(action) {
     const base = getWorkflow();
     if (!base) return null;
@@ -653,7 +820,7 @@ function buildWorkflow(action) {
 
     let targetNode = null;
 
-    for (const [id, node] of Object.entries(wf)) {
+    for (const node of Object.values(wf)) {
         if (!node?.class_type) continue;
 
         if (node.class_type === "CLIPTextEncode" && node.inputs) {
@@ -691,84 +858,139 @@ function buildComfyUrl(pathname) {
 
 function buildViewUrl(img) {
     const url = new URL(buildComfyUrl("/view"));
-    url.searchParams.set("filename", String(img?.filename || ""));
-    url.searchParams.set("subfolder", String(img?.subfolder || ""));
-    url.searchParams.set("type", String(img?.type || "output"));
+
+    url.searchParams.set("filename", img?.filename || "");
+    url.searchParams.set("type", img?.type || "output");
+
+    const subfolder =
+        img?.subfolder === null ||
+        img?.subfolder === undefined
+            ? ""
+            : String(img.subfolder);
+
+    url.searchParams.set("subfolder", subfolder);
+
     return url.toString();
 }
 
-function send(wf) {
-    return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: buildComfyUrl("/prompt"),
-            headers: { "Content-Type": "application/json" },
-            data: JSON.stringify({ prompt: wf }),
-            onload: r => {
-                try {
-                    resolve(JSON.parse(r.responseText));
-                } catch (e) {
-                    reject(e);
-                }
-            },
-            onerror: reject
-        });
+async function send(wf) {
+    const r = await makeRequest({
+        method: "POST",
+        url: buildComfyUrl("/prompt"),
+        headers: { "Content-Type": "application/json" },
+        data: JSON.stringify({ prompt: wf }),
+        timeout: 30000
     });
+
+    if (r.status < 200 || r.status >= 300) {
+        throw new Error(`ComfyUI /prompt HTTP ${r.status}: ${String(r.responseText || "").slice(0, 300)}`);
+    }
+
+    return JSON.parse(r.responseText || "{}");
 }
 
 function pollResult(promptId) {
     return new Promise((resolve, reject) => {
-        let tries = 0;
+        if (stopRequested) {
+            reject(new Error("stopped"));
+            return;
+        }
 
-        const t = setInterval(() => {
+        let tries = 0;
+        let settled = false;
+        let timer = null;
+
+        const cleanup = () => {
+            if (timer) clearTimeout(timer);
+            activePollCancels.delete(cancel);
+        };
+
+        const finishResolve = (value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+        };
+
+        const finishReject = (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+        };
+
+        const cancel = () => finishReject(new Error("stopped"));
+        activePollCancels.add(cancel);
+
+        const tick = async () => {
+            if (settled) return;
+            if (stopRequested) return finishReject(new Error("stopped"));
+
             tries++;
 
-            GM_xmlhttpRequest({
-                method: "GET",
-                url: buildComfyUrl(`/history/${encodeURIComponent(promptId)}`),
-                onload: r => {
-                    try {
-                        const data = JSON.parse(r.responseText);
-                        const entry = data?.[promptId];
+            try {
+                const r = await makeRequest({
+                    method: "GET",
+                    url: buildComfyUrl(`/history/${encodeURIComponent(promptId)}`),
+                    timeout: 10000
+                });
 
-                        if (!entry) return;
+                if (stopRequested) return finishReject(new Error("stopped"));
 
-                        const status = entry?.status?.status_str;
+                if (r.status < 200 || r.status >= 300) {
+                    throw new Error(`ComfyUI /history HTTP ${r.status}`);
+                }
 
-                        if (status === "error" || status === "canceled") {
-                            clearInterval(t);
-                            reject("ComfyUI error");
-                            return;
-                        }
+                const data = JSON.parse(r.responseText || "{}");
 
-                        const outputs = entry?.outputs;
+                let entry =
+                    data?.[promptId] ||
+                    data?.[String(promptId)] ||
+                    null;
 
-                        if (outputs) {
-                            for (const k in outputs) {
-                                const imgs = outputs[k]?.images;
-                                if (imgs?.length) {
-                                    clearInterval(t);
-                                    const img = imgs[0];
-                                    resolve(buildViewUrl(img));
-                                    return;
-                                }
+                if (!entry && data && typeof data === "object") {
+                    entry = Object.values(data).find(v => {
+                        const pid = String(v?.prompt_id || "");
+                        return pid === String(promptId) || (v?.outputs && v?.status);
+                    }) || null;
+                }
+
+                if (entry) {
+                    const status = entry?.status?.status_str;
+
+                    if (status === "error" || status === "canceled") {
+                        return finishReject(new Error("ComfyUI error"));
+                    }
+
+                    const outputs = entry?.outputs;
+
+                    if (outputs) {
+                        for (const k in outputs) {
+                            const imgs = outputs[k]?.images;
+                            if (imgs?.length) {
+                                return finishResolve(buildViewUrl(imgs[0]));
                             }
                         }
-
-                    } catch {}
+                    }
                 }
-            });
+            } catch (e) {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                console.warn("ComfyUI poll tick failed:", e);
+            }
 
             if (tries > 60) {
-                clearInterval(t);
-                reject("timeout");
+                return finishReject(new Error("timeout"));
             }
-        }, 2000);
+
+            timer = setTimeout(tick, 2000);
+        };
+
+        tick();
     });
 }
 
 function ensurePreview(id) {
-    let el = document.querySelector(`[data-ph-img="${id}"]`);
+    let el = document.querySelector(`[data-ph-img="${CSS.escape(id)}"]`);
     if (el) return el;
 
     el = document.createElement("div");
@@ -826,7 +1048,9 @@ function openViewer(url) {
 }
 
 function attachInline(card, preview) {
-    card.appendChild(preview);
+    if (preview.parentElement !== card) {
+        card.appendChild(preview);
+    }
 }
 
 function styleField(el) {
@@ -1001,6 +1225,7 @@ function renderTextAISection(container) {
 
     provider.onchange = e => {
         STATE.textAI.provider = e.target.value || null;
+        openRouterCooldownUntil = 0;
         save();
         renderFields();
     };
@@ -1013,28 +1238,28 @@ function renderTextAISection(container) {
     container.appendChild(fields);
 }
 
-function testComfyUIConnection() {
-    return new Promise(resolve => {
-        GM_xmlhttpRequest({
+async function testComfyUIConnection() {
+    try {
+        const r = await makeRequest({
             method: "GET",
             url: buildComfyUrl("/system_stats"),
-            timeout: 8000,
-            onload: r => {
-                if (r.status >= 200 && r.status < 300) resolve("ComfyUI: OK");
-                else resolve(`ComfyUI: FAIL (${r.status})`);
-            },
-            onerror: () => resolve("ComfyUI: FAIL"),
-            ontimeout: () => resolve("ComfyUI: TIMEOUT")
+            timeout: 8000
         });
-    });
+
+        if (r.status >= 200 && r.status < 300) return "ComfyUI: OK";
+        return `ComfyUI: FAIL (${r.status})`;
+    } catch (e) {
+        if (stopRequested) return "ComfyUI: STOPPED";
+        return "ComfyUI: FAIL";
+    }
 }
 
-function testOpenRouterConnection() {
+async function testOpenRouterConnection() {
     const cfg = STATE.textAI.openrouter;
-    if (!cfg?.apiKey) return Promise.resolve("Text AI (OpenRouter): SKIPPED (missing API key)");
+    if (!cfg?.apiKey) return "Text AI (OpenRouter): SKIPPED (missing API key)";
 
-    return new Promise(resolve => {
-        GM_xmlhttpRequest({
+    try {
+        const r = await makeRequest({
             method: "POST",
             url: "https://openrouter.ai/api/v1/chat/completions",
             headers: {
@@ -1052,22 +1277,30 @@ function testOpenRouterConnection() {
                 max_tokens: 5,
                 temperature: 0
             }),
-            timeout: 15000,
-            onload: r => {
-                if (r.status >= 200 && r.status < 300) resolve("Text AI (OpenRouter): OK");
-                else resolve(`Text AI (OpenRouter): FAIL (${r.status})`);
-            },
-            onerror: () => resolve("Text AI (OpenRouter): FAIL"),
-            ontimeout: () => resolve("Text AI (OpenRouter): TIMEOUT")
+            timeout: 15000
         });
-    });
+
+        if (r.status >= 200 && r.status < 300) return "Text AI (OpenRouter): OK";
+
+        if (r.status === 429) {
+            const retryAfter = parseInt(getResponseHeader(r.responseHeaders, "retry-after"), 10);
+            const cooldownMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 45000;
+            openRouterCooldownUntil = Date.now() + cooldownMs;
+            return `Text AI (OpenRouter): FAIL (429 rate limited, cooldown ${Math.ceil(cooldownMs / 1000)}s)`;
+        }
+
+        return `Text AI (OpenRouter): FAIL (${r.status})`;
+    } catch {
+        if (stopRequested) return "Text AI (OpenRouter): STOPPED";
+        return "Text AI (OpenRouter): FAIL";
+    }
 }
 
-function testOpenAICompatibleConnection() {
+async function testOpenAICompatibleConnection() {
     const cfg = STATE.textAI.openaiCompatible;
     const endpoint = normalizeCompatibleEndpoint(cfg.endpoint);
 
-    return new Promise(resolve => {
+    try {
         const headers = {
             "Content-Type": "application/json"
         };
@@ -1076,7 +1309,7 @@ function testOpenAICompatibleConnection() {
             headers.Authorization = `Bearer ${cfg.apiKey}`;
         }
 
-        GM_xmlhttpRequest({
+        const r = await makeRequest({
             method: "POST",
             url: endpoint,
             headers,
@@ -1089,15 +1322,34 @@ function testOpenAICompatibleConnection() {
                 max_tokens: 5,
                 temperature: 0
             }),
-            timeout: 15000,
-            onload: r => {
-                if (r.status >= 200 && r.status < 300) resolve("Text AI (OpenAI Compatible): OK");
-                else resolve(`Text AI (OpenAI Compatible): FAIL (${r.status})`);
-            },
-            onerror: () => resolve("Text AI (OpenAI Compatible): FAIL"),
-            ontimeout: () => resolve("Text AI (OpenAI Compatible): TIMEOUT")
+            timeout: 15000
         });
-    });
+
+        if (r.status >= 200 && r.status < 300) return "Text AI (OpenAI Compatible): OK";
+        return `Text AI (OpenAI Compatible): FAIL (${r.status})`;
+    } catch {
+        if (stopRequested) return "Text AI (OpenAI Compatible): STOPPED";
+        return "Text AI (OpenAI Compatible): FAIL";
+    }
+}
+
+async function testComfyUIImageBlobLoad() {
+    try {
+        const r = await makeRequest({
+            method: "GET",
+            url: buildComfyUrl("/history"),
+            timeout: 8000
+        });
+
+        if (r.status >= 200 && r.status < 300) {
+            return "Image preview method: CSP-safe blob loader enabled";
+        }
+
+        return `Image preview method: blob loader enabled, history check failed (${r.status})`;
+    } catch {
+        if (stopRequested) return "Image preview method: STOPPED";
+        return "Image preview method: blob loader enabled";
+    }
 }
 
 async function runConnectionTest() {
@@ -1112,6 +1364,7 @@ async function runConnectionTest() {
         results.push("Text AI: DISABLED");
     }
 
+    results.push(await testComfyUIImageBlobLoad());
     results.push(STATE.activeWorkflow ? "Workflow: Loaded" : "Workflow: Not loaded");
     alert(results.join("\n"));
 }
@@ -1255,8 +1508,20 @@ function openModal() {
         display: "flex",
         justifyContent: "space-between",
         gap: "10px",
-        alignItems: "center"
+        alignItems: "center",
+        flexWrap: "wrap"
     });
+
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.id = STOP_BTN_ID;
+    stop.textContent = stopRequested ? "STOPPED" : "STOP";
+    styleButton(stop, "danger");
+
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.textContent = "Resume";
+    styleButton(resume, "muted");
 
     const test = document.createElement("button");
     test.type = "button";
@@ -1268,6 +1533,8 @@ function openModal() {
     close.textContent = "Close";
     styleButton(close);
 
+    bottom.appendChild(stop);
+    bottom.appendChild(resume);
     bottom.appendChild(test);
     bottom.appendChild(close);
 
@@ -1330,6 +1597,15 @@ function openModal() {
         } catch {}
     };
 
+    stop.onclick = () => {
+        stopAllRequests();
+    };
+
+    resume.onclick = () => {
+        resetStopState();
+        scheduleProcess(100);
+    };
+
     test.onclick = () => {
         runConnectionTest();
     };
@@ -1337,20 +1613,91 @@ function openModal() {
     close.onclick = () => m.remove();
 }
 
+function blobFromComfyUrl(url) {
+    return new Promise((resolve, reject) => {
+        if (stopRequested) {
+            reject(new Error("stopped"));
+            return;
+        }
+
+        makeRequest({
+            method: "GET",
+            url,
+            responseType: "blob",
+            timeout: 20000,
+            onload: r => {
+                if (r.status < 200 || r.status >= 300) {
+                    throw new Error(`Image HTTP ${r.status}`);
+                }
+
+                const blob = r.response;
+
+                if (!blob || !String(blob.type || "").startsWith("image/")) {
+                    console.warn("ComfyUI image response was not an image blob:", {
+                        status: r.status,
+                        contentType: blob?.type,
+                        url
+                    });
+                }
+
+                return blob;
+            }
+        }).then(resolve).catch(reject);
+    });
+}
+
 function loadImageWithRetry(img, url, preview) {
     let retryCount = 0;
+    let lastObjectUrl = null;
 
-    const tryLoad = () => {
+    const tryLoad = async () => {
+        if (stopRequested) return;
+
         const bust = `t=${Date.now()}&r=${retryCount}`;
-        img.src = url + (url.includes("?") ? "&" : "?") + bust;
-    };
+        const bustedUrl = url + (url.includes("?") ? "&" : "?") + bust;
 
-    img.onerror = () => {
-        if (retryCount < 5) {
-            retryCount++;
-            setTimeout(tryLoad, 1000);
-        } else {
-            preview.innerHTML = "Image generated but preview failed to load";
+        try {
+            const blob = await blobFromComfyUrl(bustedUrl);
+            if (stopRequested) return;
+
+            if (lastObjectUrl) {
+                try {
+                    URL.revokeObjectURL(lastObjectUrl);
+                    objectUrls.delete(lastObjectUrl);
+                } catch {}
+            }
+
+            const objectUrl = URL.createObjectURL(blob);
+            objectUrls.add(objectUrl);
+            lastObjectUrl = objectUrl;
+
+            img.onload = () => {
+                preview.dataset.phLoaded = "true";
+            };
+
+            img.onerror = e => {
+                console.warn("Blob image failed to render:", e, objectUrl);
+
+                if (retryCount < 5) {
+                    retryCount++;
+                    setTimeout(tryLoad, 1000);
+                } else {
+                    preview.innerHTML = "Image generated but blob preview failed to render";
+                }
+            };
+
+            img.src = objectUrl;
+        } catch (e) {
+            if (stopRequested) return;
+
+            console.warn("Image blob load failed:", e, bustedUrl);
+
+            if (retryCount < 5) {
+                retryCount++;
+                setTimeout(tryLoad, 1000);
+            } else {
+                preview.innerHTML = "Image generated but preview failed to load";
+            }
         }
     };
 
@@ -1358,66 +1705,127 @@ function loadImageWithRetry(img, url, preview) {
 }
 
 async function process() {
-    ensureButton();
+    if (stopRequested) return;
 
-    const cards = getActions();
-    if (!cards.length) return;
+    if (processRunning) {
+        processQueued = true;
+        return;
+    }
 
-    const baseWorkflow = getWorkflow();
-    const hints = extractWorkflowPromptHints(baseWorkflow);
+    processRunning = true;
 
-    for (const card of cards) {
-        const action = extract(card);
-        if (!action.body && !action.title) continue;
+    try {
+        ensureButton();
 
-        const sig = signature(action);
-        if (processed.has(sig)) continue;
-        processed.add(sig);
+        const cards = getActions();
+        if (!cards.length) return;
 
-        const preview = ensurePreview(sig);
-        attachInline(card, preview);
-        preview.innerHTML = "Queued...";
+        const baseWorkflow = getWorkflow();
+        const hints = extractWorkflowPromptHints(baseWorkflow);
 
-        const refined = await refineActionWithTextAI(action, hints);
-        const wf = buildWorkflow(refined);
-        if (!wf) {
-            preview.innerHTML = "Failed to generate image";
-            continue;
+        for (const card of cards) {
+            if (stopRequested) return;
+
+            const action = extract(card);
+            if (!action.body && !action.title) continue;
+
+            const sig = signature(action);
+            if (processed.has(sig)) continue;
+            processed.add(sig);
+
+            const preview = ensurePreview(sig);
+            attachInline(card, preview);
+            preview.innerHTML = "Queued...";
+
+            const refined = await refineActionWithTextAI(action, hints);
+            if (stopRequested) return;
+
+            const wf = buildWorkflow(refined);
+            if (!wf) {
+                preview.innerHTML = "Failed to build image prompt";
+                continue;
+            }
+
+            try {
+                const res = await send(wf);
+                if (stopRequested) return;
+
+                const promptId = res?.prompt_id;
+                if (!promptId) {
+                    preview.innerHTML = "Image request accepted, but no prompt id returned";
+                    continue;
+                }
+
+                let url = null;
+                try {
+                    url = await pollResult(promptId);
+                } catch (err) {
+                    if (stopRequested) return;
+                    console.warn("Polling failed but the image may still exist:", err);
+                }
+
+                if (stopRequested) return;
+
+                if (url) {
+                    const img = document.createElement("img");
+                    img.alt = "Generated image";
+
+                    Object.assign(img.style, {
+                        display: "block",
+                        width: "100%",
+                        maxWidth: "100%",
+                        margin: "0 auto",
+                        borderRadius: "10px",
+                        cursor: "pointer"
+                    });
+
+                    img.onclick = () => openViewer(img.src);
+
+                    preview.innerHTML = "";
+                    preview.appendChild(img);
+
+                    loadImageWithRetry(img, url, preview);
+                } else {
+                    preview.innerHTML = "Image generated (preview sync failed)";
+                }
+            } catch (err) {
+                if (stopRequested) return;
+                console.warn("Image generation request failed:", err);
+                if (!preview.querySelector("img")) {
+                    preview.innerHTML = "Failed to generate image";
+                }
+            }
         }
+    } finally {
+        processRunning = false;
 
-        send(wf)
-            .then(res => {
-                return pollResult(res?.prompt_id);
-            })
-            .then(url => {
-                const img = document.createElement("img");
-                img.alt = "Generated image";
-
-                Object.assign(img.style, {
-                    display: "block",
-                    width: "100%",
-                    maxWidth: "100%",
-                    margin: "0 auto",
-                    borderRadius: "10px",
-                    cursor: "pointer"
-                });
-
-                img.onclick = () => openViewer(img.src);
-
-                preview.innerHTML = "";
-                preview.appendChild(img);
-
-                loadImageWithRetry(img, url, preview);
-            })
-            .catch(() => {
-                preview.innerHTML = "Failed to generate image";
-            });
+        if (processQueued && !stopRequested) {
+            processQueued = false;
+            scheduleProcess(500);
+        }
     }
 }
 
-const observer = new MutationObserver(process);
+function scheduleProcess(delay = 500) {
+    if (stopRequested) return;
+
+    if (processTimer) {
+        clearTimeout(processTimer);
+        processTimer = null;
+    }
+
+    processTimer = setTimeout(() => {
+        processTimer = null;
+        process();
+    }, delay);
+}
+
+observer = new MutationObserver(() => {
+    scheduleProcess(500);
+});
+
 observer.observe(document.body, { childList: true, subtree: true });
 
-process();
+scheduleProcess(100);
 
 })();
