@@ -4,6 +4,7 @@
 // @match        https://www.paxhistoria.co/*
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
+// @connect      localhost
 // @connect      openrouter.ai
 // @connect      api.openrouter.ai
 // @run-at       document-end
@@ -246,6 +247,89 @@ function compressAction(body) {
 }
 
 /* =========================
+   CONTEXTUAL TAG INFERENCE
+========================= */
+function hasLikelyHumanCue(action) {
+    const text = `${action?.title || ""} ${action?.body || ""} ${(action?.factions || []).join(" ")}`;
+
+    if (/\b(king|queen|prince|princess|emperor|empress|president|prime minister|minister|general|commander|admiral|captain|soldier|officer|leader|ambassador|chancellor|governor|duke|duchess|lord|lady|man|woman|boy|girl|person|ruler|warrior|pilot|spy|agent)\b/i.test(text)) {
+        return true;
+    }
+
+    if (/\b[A-Z][a-z]+ [A-Z][a-z]+\b/.test(text)) {
+        return true;
+    }
+
+    return false;
+}
+
+function inferContextualTags(action) {
+    const text = `${action?.title || ""} ${action?.body || ""} ${(action?.factions || []).join(" ")}`.toLowerCase();
+    const tags = [];
+
+    const human = hasLikelyHumanCue(action);
+
+    if (human) {
+        tags.push(
+            "highly detailed character design",
+            "realistic facial features",
+            "detailed clothing",
+            "anatomically accurate"
+        );
+    }
+
+    if (/\b(military|army|soldier|battle|war|frontline|trench|tank|rifle|artillery|airstrike|combat|invasion|occupation|campaign)\b/i.test(text)) {
+        tags.push(
+            "military realism",
+            "authentic uniforms",
+            "detailed gear",
+            "battlefield atmosphere"
+        );
+    }
+
+    if (/\b(palace|throne|king|queen|emperor|royal|noble|court)\b/i.test(text)) {
+        tags.push(
+            "regal attire",
+            "ornate interior",
+            "luxurious materials"
+        );
+    }
+
+    if (/\b(diplomat|diplomatic|negotiation|treaty|summit|parliament|senate|congress|council|meeting|conference)\b/i.test(text)) {
+        tags.push(
+            "formal interior",
+            "document detail",
+            "serious political atmosphere"
+        );
+    }
+
+    if (/\b(city|street|village|town|capital|market|crowd|protest|riot|square)\b/i.test(text)) {
+        tags.push(
+            "urban environment detail",
+            "crowd realism",
+            "street-level atmosphere"
+        );
+    }
+
+    if (/\b(fire|smoke|explosion|burning|ruins|wreckage|debris)\b/i.test(text)) {
+        tags.push(
+            "smoke and debris",
+            "dramatic destruction",
+            "chaotic aftermath"
+        );
+    }
+
+    if (/\b(desert|snow|rain|fog|storm|night|dawn|sunset)\b/i.test(text)) {
+        tags.push(
+            "weather realism",
+            "atmospheric lighting"
+        );
+    }
+
+    return [...new Set(tags)];
+}
+
+/* =========================
    TEXT AI LAYER
 ========================= */
 function buildTextAIPrompt(action, hints) {
@@ -253,28 +337,70 @@ function buildTextAIPrompt(action, hints) {
     const negativeTags = hints?.negativePrompt || "";
 
     return `
-You are a VISUAL SCENE COMPRESSOR for Stable Diffusion / ComfyUI.
+You are a VISUAL WORLD-TO-IMAGE TRANSLATION ENGINE.
 
-Your job is NOT to summarize text.
+Your job is NOT summarization.
 
-Your job is to convert a narrative game action into ONE frozen cinematic image frame.
-
-========================
-CORE TASK
-========================
-Extract ONLY the most visually intense moment that could exist as a still image.
-
-If multiple events exist, choose ONE moment with the strongest visual clarity.
+Your job is to convert text into a FULLY VISUAL, HIGHLY DETAILED image prompt for Stable Diffusion / ComfyUI.
 
 ========================
-STRICT OUTPUT RULES
+CRITICAL RULE
 ========================
-- Output ONLY valid JSON.
-- Do NOT include explanations.
-- Do NOT include narrative or lore.
-- Do NOT describe meaning, politics, or context.
-- Do NOT include abstract ideas (tension, influence, diplomacy, etc.).
-- If something cannot be seen in an image, it MUST NOT appear.
+If the input lacks visual detail, you MUST invent plausible detail from context.
+
+Never output vague prompts like:
+- "NAME does such and such"
+- "the leader speaks"
+- "the general reacts"
+
+Instead, ALWAYS expand into a concrete scene with visible detail:
+- appearance
+- age range
+- facial structure
+- hair
+- clothing
+- posture
+- props
+- environment
+- lighting
+- mood shown physically, not abstractly
+
+========================
+CHARACTER RULE
+========================
+If a person, leader, named figure, or human-like subject is present or implied, you MUST automatically infer:
+- age range
+- likely ethnicity or regional appearance based on context, not stereotypes
+- facial structure
+- hair style and condition
+- skin texture
+- clothing appropriate to role, era, faction, or setting
+- visible posture and expression
+- relevant gear, insignia, tools, documents, weapons, or accessories
+
+Never leave a named person as just a name.
+
+========================
+DETAIL ENRICHMENT RULE
+========================
+When detail is missing, fill it in with contextually plausible specifics so the image generator has something to work with.
+
+Examples of acceptable enrichment:
+- "stern middle-aged war general in a decorated uniform"
+- "tired civilian leader in a dim war room"
+- "dust-covered messenger running through a ruined street"
+- "crowded diplomatic chamber with flags, maps, and documents"
+
+========================
+STYLE TAG RULE
+========================
+If the scene contains a person, include people-focused realism tags such as:
+- highly detailed character design
+- realistic facial features
+- detailed clothing
+- anatomically accurate
+
+If the scene does NOT contain a person, do NOT force human anatomy tags.
 
 ========================
 WORKFLOW STYLE TAGS
@@ -288,6 +414,7 @@ ${negativeTags || "(none)"}
 ========================
 OUTPUT FORMAT
 ========================
+Return ONLY valid JSON in this exact shape:
 {
   "prompt": "string",
   "title": "string",
@@ -295,32 +422,26 @@ OUTPUT FORMAT
 }
 
 ========================
-PROMPT CONSTRUCTION RULES
+PROMPT CONSTRUCTION RULE
 ========================
-The "prompt" field must be a Stable Diffusion / ComfyUI-ready prompt.
+The prompt must be built like this internally:
 
-It MUST follow this structure internally:
-
-[SUBJECT] + [ACTION] + [ENVIRONMENT] + [CAMERA] + [LIGHTING] + [STYLE]
-
-Rules:
-- Subject must be concrete (people, vehicles, objects, units, structures)
-- Action must be physically visible (walking, marching, burning, negotiating, aiming, collapsing, etc.)
-- Environment must be real and drawable (city street, battlefield, palace interior, desert convoy route, etc.)
-- Camera must imply framing (wide shot, close-up, aerial view, cinematic angle)
-- Lighting must be physical (sunset, neon glow, harsh floodlights, foggy dawn, etc.)
-- Style must be realistic cinematic unless otherwise implied
+[SUBJECT - fully described]
++ [ACTION - physically visible]
++ [ENVIRONMENT - detailed and drawable]
++ [CHARACTER DESIGN - only if a human is present]
++ [CAMERA - cinematic framing]
++ [LIGHTING - physical lighting]
++ [STYLE - cinematic realism]
 
 ========================
 VISUAL PRIORITY RULES
 ========================
-- PRIORITIZE what a camera would capture in a single frame
-- REMOVE anything that is:
-  - political explanation
-  - strategic reasoning
-  - historical narration
-  - invisible systems or concepts
-- ONLY keep what can be rendered visually
+- Prioritize what a camera could capture in a single frame
+- Remove anything invisible or abstract
+- Convert abstract ideas into visible imagery
+- Replace weak nouns with concrete visual equivalents
+- If a person is only named, invent a believable visual identity from context
 
 ========================
 INPUT
@@ -333,8 +454,8 @@ Factions: ${(action.factions || []).join(", ")}
 ========================
 FINAL REQUIREMENT
 ========================
-Return the most visually cinematic single-frame interpretation of the action.
-${positiveTags ? `\nIMPORTANT: preserve these exact tags verbatim somewhere in the prompt: ${positiveTags}` : ""}
+Return ONE ultra-detailed cinematic prompt suitable for image generation.
+${positiveTags ? `\nImportant: preserve these exact positive tags verbatim somewhere in the prompt: ${positiveTags}` : ""}
 `;
 }
 
@@ -500,12 +621,14 @@ function buildPrompt(action, hints) {
         .slice(0, 120);
 
     const styleTags = hints?.positivePrompt || "";
+    const inferredTags = inferContextualTags(action).join(", ");
 
     return [
         action.date ? action.date + "." : "",
         factionText,
         title,
         visual,
+        inferredTags,
         styleTags,
         "",
         "cinematic wide shot",
@@ -558,14 +681,36 @@ function buildWorkflow(action) {
     return wf;
 }
 
+function buildComfyUrl(pathname) {
+    try {
+        return new URL(pathname, STATE.host).toString();
+    } catch {
+        return STATE.host.replace(/\/+$/, "") + pathname;
+    }
+}
+
+function buildViewUrl(img) {
+    const url = new URL(buildComfyUrl("/view"));
+    url.searchParams.set("filename", String(img?.filename || ""));
+    url.searchParams.set("subfolder", String(img?.subfolder || ""));
+    url.searchParams.set("type", String(img?.type || "output"));
+    return url.toString();
+}
+
 function send(wf) {
     return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
             method: "POST",
-            url: STATE.host + "/prompt",
+            url: buildComfyUrl("/prompt"),
             headers: { "Content-Type": "application/json" },
             data: JSON.stringify({ prompt: wf }),
-            onload: r => resolve(JSON.parse(r.responseText)),
+            onload: r => {
+                try {
+                    resolve(JSON.parse(r.responseText));
+                } catch (e) {
+                    reject(e);
+                }
+            },
             onerror: reject
         });
     });
@@ -580,7 +725,7 @@ function pollResult(promptId) {
 
             GM_xmlhttpRequest({
                 method: "GET",
-                url: `${STATE.host}/history/${promptId}`,
+                url: buildComfyUrl(`/history/${encodeURIComponent(promptId)}`),
                 onload: r => {
                     try {
                         const data = JSON.parse(r.responseText);
@@ -604,9 +749,7 @@ function pollResult(promptId) {
                                 if (imgs?.length) {
                                     clearInterval(t);
                                     const img = imgs[0];
-                                    resolve(
-                                        `${STATE.host}/view?filename=${img.filename}&subfolder=${img.subfolder}&type=${img.type}`
-                                    );
+                                    resolve(buildViewUrl(img));
                                     return;
                                 }
                             }
@@ -634,12 +777,17 @@ function ensurePreview(id) {
 
     Object.assign(el.style, {
         marginTop: "12px",
+        marginLeft: "auto",
+        marginRight: "auto",
         padding: "10px",
         borderRadius: "12px",
         background: "rgba(20,20,20,0.75)",
         color: "#fff",
         fontSize: "12px",
-        maxWidth: "420px"
+        maxWidth: "420px",
+        width: "100%",
+        boxSizing: "border-box",
+        textAlign: "center"
     });
 
     el.innerHTML = "Generating image...";
@@ -865,6 +1013,109 @@ function renderTextAISection(container) {
     container.appendChild(fields);
 }
 
+function testComfyUIConnection() {
+    return new Promise(resolve => {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: buildComfyUrl("/system_stats"),
+            timeout: 8000,
+            onload: r => {
+                if (r.status >= 200 && r.status < 300) resolve("ComfyUI: OK");
+                else resolve(`ComfyUI: FAIL (${r.status})`);
+            },
+            onerror: () => resolve("ComfyUI: FAIL"),
+            ontimeout: () => resolve("ComfyUI: TIMEOUT")
+        });
+    });
+}
+
+function testOpenRouterConnection() {
+    const cfg = STATE.textAI.openrouter;
+    if (!cfg?.apiKey) return Promise.resolve("Text AI (OpenRouter): SKIPPED (missing API key)");
+
+    return new Promise(resolve => {
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: "https://openrouter.ai/api/v1/chat/completions",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${cfg.apiKey}`,
+                "HTTP-Referer": location.origin,
+                "X-Title": "Pax Historia Image Gen"
+            },
+            data: JSON.stringify({
+                model: cfg.model,
+                messages: [
+                    { role: "system", content: "Return only the word OK." },
+                    { role: "user", content: "ping" }
+                ],
+                max_tokens: 5,
+                temperature: 0
+            }),
+            timeout: 15000,
+            onload: r => {
+                if (r.status >= 200 && r.status < 300) resolve("Text AI (OpenRouter): OK");
+                else resolve(`Text AI (OpenRouter): FAIL (${r.status})`);
+            },
+            onerror: () => resolve("Text AI (OpenRouter): FAIL"),
+            ontimeout: () => resolve("Text AI (OpenRouter): TIMEOUT")
+        });
+    });
+}
+
+function testOpenAICompatibleConnection() {
+    const cfg = STATE.textAI.openaiCompatible;
+    const endpoint = normalizeCompatibleEndpoint(cfg.endpoint);
+
+    return new Promise(resolve => {
+        const headers = {
+            "Content-Type": "application/json"
+        };
+
+        if (cfg.apiKey) {
+            headers.Authorization = `Bearer ${cfg.apiKey}`;
+        }
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: endpoint,
+            headers,
+            data: JSON.stringify({
+                model: cfg.model,
+                messages: [
+                    { role: "system", content: "Return only the word OK." },
+                    { role: "user", content: "ping" }
+                ],
+                max_tokens: 5,
+                temperature: 0
+            }),
+            timeout: 15000,
+            onload: r => {
+                if (r.status >= 200 && r.status < 300) resolve("Text AI (OpenAI Compatible): OK");
+                else resolve(`Text AI (OpenAI Compatible): FAIL (${r.status})`);
+            },
+            onerror: () => resolve("Text AI (OpenAI Compatible): FAIL"),
+            ontimeout: () => resolve("Text AI (OpenAI Compatible): TIMEOUT")
+        });
+    });
+}
+
+async function runConnectionTest() {
+    const results = [];
+    results.push(await testComfyUIConnection());
+
+    if (STATE.textAI.provider === "openrouter") {
+        results.push(await testOpenRouterConnection());
+    } else if (STATE.textAI.provider === "openai-compatible") {
+        results.push(await testOpenAICompatibleConnection());
+    } else {
+        results.push("Text AI: DISABLED");
+    }
+
+    results.push(STATE.activeWorkflow ? "Workflow: Loaded" : "Workflow: Not loaded");
+    alert(results.join("\n"));
+}
+
 function openModal() {
     let m = $("#" + MODAL_ID);
     if (m) {
@@ -986,17 +1237,11 @@ function openModal() {
         flexWrap: "wrap"
     });
 
-    const wfSetActive = document.createElement("button");
-    wfSetActive.type = "button";
-    wfSetActive.textContent = "Set Active";
-    styleButton(wfSetActive, "muted");
-
     const wfDelete = document.createElement("button");
     wfDelete.type = "button";
     wfDelete.textContent = "Delete Selected";
     styleButton(wfDelete, "danger");
 
-    wfActions.appendChild(wfSetActive);
     wfActions.appendChild(wfDelete);
 
     wfSection.appendChild(wfLabel);
@@ -1073,12 +1318,6 @@ function openModal() {
         renderWorkflowList(wfSelect, wfStatus, wfDelete);
     };
 
-    wfSetActive.onclick = () => {
-        STATE.activeWorkflow = wfSelect.value || null;
-        save();
-        renderWorkflowList(wfSelect, wfStatus, wfDelete);
-    };
-
     wfDelete.onclick = () => {
         const name = wfSelect.value;
         if (!name) return;
@@ -1092,15 +1331,30 @@ function openModal() {
     };
 
     test.onclick = () => {
-        GM_xmlhttpRequest({
-            method: "GET",
-            url: STATE.host,
-            onload: () => alert("OK"),
-            onerror: () => alert("FAIL")
-        });
+        runConnectionTest();
     };
 
     close.onclick = () => m.remove();
+}
+
+function loadImageWithRetry(img, url, preview) {
+    let retryCount = 0;
+
+    const tryLoad = () => {
+        const bust = `t=${Date.now()}&r=${retryCount}`;
+        img.src = url + (url.includes("?") ? "&" : "?") + bust;
+    };
+
+    img.onerror = () => {
+        if (retryCount < 5) {
+            retryCount++;
+            setTimeout(tryLoad, 1000);
+        } else {
+            preview.innerHTML = "Image generated but preview failed to load";
+        }
+    };
+
+    tryLoad();
 }
 
 async function process() {
@@ -1137,10 +1391,13 @@ async function process() {
             })
             .then(url => {
                 const img = document.createElement("img");
-                img.src = url + "&t=" + Date.now();
+                img.alt = "Generated image";
 
                 Object.assign(img.style, {
+                    display: "block",
                     width: "100%",
+                    maxWidth: "100%",
+                    margin: "0 auto",
                     borderRadius: "10px",
                     cursor: "pointer"
                 });
@@ -1149,6 +1406,8 @@ async function process() {
 
                 preview.innerHTML = "";
                 preview.appendChild(img);
+
+                loadImageWithRetry(img, url, preview);
             })
             .catch(() => {
                 preview.innerHTML = "Failed to generate image";
