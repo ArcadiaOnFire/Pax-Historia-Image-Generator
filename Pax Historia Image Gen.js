@@ -31,19 +31,25 @@ const STATE = {
             apiKey: "",
             model: "local-model"
         }
+    },
+    visualMemory: {
+        enabled: true,
+        games: {}
     }
 };
 
 const processed = new Set();
+const activeRequests = new Set();
+const activePollCancels = new Set();
+const objectUrls = new Set();
+
 const BTN_ID = "ph-img-gen-btn";
 const MODAL_ID = "ph-img-modal";
 const VIEW_ID = "ph-img-viewer";
 const PREVIEW_CLASS = "ph-img-inline";
 const STOP_BTN_ID = "ph-img-stop-btn";
-
-const activeRequests = new Set();
-const activePollCancels = new Set();
-const objectUrls = new Set();
+const START_BTN_ID = "ph-img-start-btn";
+const CODEX_MODAL_ID = "ph-img-codex-modal";
 
 let stopRequested = false;
 let observer = null;
@@ -64,6 +70,7 @@ function mergeDeep(target, source) {
             target[key] = sv;
         }
     }
+
     return target;
 }
 
@@ -73,6 +80,7 @@ function normalizeState() {
 
     if (STATE.textAI.provider === "lmstudio" || STATE.textAI.provider === "oobabooga") {
         const legacy = STATE.textAI.provider === "lmstudio" ? STATE.textAI.lmstudio : STATE.textAI.oobabooga;
+
         if (!STATE.textAI.openaiCompatible) {
             STATE.textAI.openaiCompatible = {
                 endpoint: "http://127.0.0.1:1234/v1/chat/completions",
@@ -80,9 +88,11 @@ function normalizeState() {
                 model: "local-model"
             };
         }
-        if (legacy && legacy.host) STATE.textAI.openaiCompatible.endpoint = legacy.host;
-        if (legacy && legacy.model) STATE.textAI.openaiCompatible.model = legacy.model;
-        if (legacy && legacy.apiKey) STATE.textAI.openaiCompatible.apiKey = legacy.apiKey;
+
+        if (legacy?.host) STATE.textAI.openaiCompatible.endpoint = legacy.host;
+        if (legacy?.model) STATE.textAI.openaiCompatible.model = legacy.model;
+        if (legacy?.apiKey) STATE.textAI.openaiCompatible.apiKey = legacy.apiKey;
+
         STATE.textAI.provider = "openai-compatible";
     }
 
@@ -100,6 +110,33 @@ function normalizeState() {
             model: "local-model"
         };
     }
+
+    if (!STATE.visualMemory) STATE.visualMemory = { enabled: true, games: {} };
+    if (typeof STATE.visualMemory.enabled !== "boolean") STATE.visualMemory.enabled = true;
+    if (!STATE.visualMemory.games || typeof STATE.visualMemory.games !== "object") STATE.visualMemory.games = {};
+
+    for (const gameId of Object.keys(STATE.visualMemory.games)) {
+        const mem = STATE.visualMemory.games[gameId] || {};
+
+        if (!mem.characters || typeof mem.characters !== "object") mem.characters = {};
+        if (!mem.factions || typeof mem.factions !== "object") mem.factions = {};
+        if (!mem.promptCache || typeof mem.promptCache !== "object") mem.promptCache = {};
+        if (!mem.meta || typeof mem.meta !== "object") mem.meta = {};
+
+        for (const [key, c] of Object.entries(mem.characters)) {
+            const normalized = normalizeCharacterRecord(c, key);
+            delete mem.characters[key];
+            if (normalized.id) mem.characters[normalized.id] = normalized;
+        }
+
+        for (const [key, f] of Object.entries(mem.factions)) {
+            const normalized = normalizeFactionRecord(f, key);
+            delete mem.factions[key];
+            if (normalized.id) mem.factions[normalized.id] = normalized;
+        }
+
+        STATE.visualMemory.games[gameId] = mem;
+    }
 }
 
 function save() {
@@ -112,6 +149,7 @@ function load() {
         const r = localStorage.getItem(STATE_KEY);
         if (r) mergeDeep(STATE, JSON.parse(r));
     } catch {}
+
     normalizeState();
 }
 
@@ -125,11 +163,366 @@ function getRef() {
     return document.querySelector('nav li:has(a[href="/games"])');
 }
 
+function getGameId() {
+    const m = location.pathname.match(/\/game\/([^/?#]+)/i);
+    return m ? m[1] : "global";
+}
+
+function getGameMemory() {
+    normalizeState();
+
+    const id = getGameId();
+
+    if (!STATE.visualMemory.games[id]) {
+        STATE.visualMemory.games[id] = {
+            characters: {},
+            factions: {},
+            promptCache: {},
+            meta: {
+                gameId: id,
+                createdAt: new Date().toISOString()
+            }
+        };
+    }
+
+    const mem = STATE.visualMemory.games[id];
+
+    if (!mem.characters) mem.characters = {};
+    if (!mem.factions) mem.factions = {};
+    if (!mem.promptCache) mem.promptCache = {};
+    if (!mem.meta) mem.meta = {};
+
+    mem.meta.gameId = id;
+    mem.meta.lastSeenAt = new Date().toISOString();
+
+    return mem;
+}
+
+function stableHash(str) {
+    let h = 2166136261;
+
+    for (let i = 0; i < String(str).length; i++) {
+        h ^= String(str).charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+
+    return Math.abs(h >>> 0);
+}
+
+function normalizeText(s) {
+    return String(s || "")
+        .replace(/[“”"]/g, "")
+        .replace(/[’]/g, "'")
+        .replace(/\s+/g, " ")
+        .replace(/[.,;:!?]+$/g, "")
+        .trim();
+}
+
+function titleCaseLoose(name) {
+    return normalizeText(name)
+        .split(" ")
+        .filter(Boolean)
+        .map(w => {
+            if (w.length <= 2 && w === w.toUpperCase()) return w;
+            if (/^[A-Z0-9]+$/.test(w)) return w;
+            return w.charAt(0).toUpperCase() + w.slice(1);
+        })
+        .join(" ");
+}
+
+function memorySafeId(value) {
+    return normalizeText(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9à-öø-ÿ' -]+/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function canonicalPersonIdFromAI(item) {
+    return memorySafeId(item?.canonicalId || item?.id || item?.name || "");
+}
+
+function canonicalFactionIdFromAI(item) {
+    return memorySafeId(item?.canonicalId || item?.id || item?.name || "");
+}
+
+function normalizeCharacterRecord(c, fallbackKey = "") {
+    const name = titleCaseLoose(c?.name || fallbackKey);
+    const id = memorySafeId(c?.canonicalId || c?.id || fallbackKey || name);
+
+    return {
+        id,
+        canonicalId: id,
+        name,
+        title: normalizeText(c?.title || ""),
+        faction: normalizeText(c?.faction || ""),
+        identity: normalizeText(c?.identity || c?.appearance || c?.description || ""),
+        marks: normalizeText(c?.marks || c?.notes || ""),
+        seed: Number.isFinite(c?.seed) ? c.seed : stableHash(`${getGameId()}::character::${id}`)
+    };
+}
+
+function normalizeFactionRecord(f, fallbackKey = "") {
+    const name = normalizeText(f?.name || fallbackKey);
+    const id = memorySafeId(f?.canonicalId || f?.id || fallbackKey || name);
+
+    return {
+        id,
+        canonicalId: id,
+        name,
+        colors: normalizeText(f?.colors || ""),
+        symbols: normalizeText(f?.symbols || ""),
+        visualStyle: normalizeText(f?.visualStyle || f?.architecture || f?.uniforms || ""),
+        notes: normalizeText(f?.notes || f?.description || ""),
+        seed: Number.isFinite(f?.seed) ? f.seed : stableHash(`${getGameId()}::faction::${id}`)
+    };
+}
+
+function mergeUsefulText(oldValue, newValue, maxLen = 280) {
+    const oldText = normalizeText(oldValue);
+    const newText = normalizeText(newValue);
+
+    if (!newText) return oldText;
+    if (!oldText) return newText.slice(0, maxLen);
+    if (oldText.toLowerCase().includes(newText.toLowerCase())) return oldText;
+    if (newText.toLowerCase().includes(oldText.toLowerCase())) return newText.slice(0, maxLen);
+
+    return `${oldText}; ${newText}`.slice(0, maxLen);
+}
+
+function addTextAICodex(parsed) {
+    if (!STATE.visualMemory.enabled || !STATE.textAI.provider) return;
+
+    const mem = getGameMemory();
+    let changed = false;
+
+    const chars = Array.isArray(parsed?.codex?.characters)
+        ? parsed.codex.characters
+        : [];
+
+    const factions = Array.isArray(parsed?.codex?.factions)
+        ? parsed.codex.factions
+        : [];
+
+    for (const item of chars) {
+        if (!item?.name) continue;
+
+        const id = canonicalPersonIdFromAI(item);
+        if (!id) continue;
+
+        const rec = normalizeCharacterRecord({
+            id,
+            canonicalId: id,
+            name: item.name,
+            title: item.title || "",
+            faction: item.faction || "",
+            identity: item.identity || "",
+            marks: item.marks || ""
+        });
+
+        if (!mem.characters[id]) {
+            mem.characters[id] = rec;
+            changed = true;
+        } else {
+            const old = mem.characters[id];
+
+            old.name = old.name || rec.name;
+            old.title = old.title || rec.title;
+            old.faction = old.faction || rec.faction;
+            old.identity = mergeUsefulText(old.identity, rec.identity);
+            old.marks = mergeUsefulText(old.marks, rec.marks, 180);
+            old.seed = old.seed || rec.seed;
+
+            changed = true;
+        }
+    }
+
+    for (const item of factions) {
+        if (!item?.name) continue;
+
+        const id = canonicalFactionIdFromAI(item);
+        if (!id) continue;
+
+        const rec = normalizeFactionRecord({
+            id,
+            canonicalId: id,
+            name: item.name,
+            colors: item.colors || "",
+            symbols: item.symbols || "",
+            visualStyle: item.visualStyle || "",
+            notes: item.notes || ""
+        });
+
+        if (!mem.factions[id]) {
+            mem.factions[id] = rec;
+            changed = true;
+        } else {
+            const old = mem.factions[id];
+
+            old.name = old.name || rec.name;
+            old.colors = mergeUsefulText(old.colors, rec.colors, 120);
+            old.symbols = mergeUsefulText(old.symbols, rec.symbols, 160);
+            old.visualStyle = mergeUsefulText(old.visualStyle, rec.visualStyle, 220);
+            old.notes = mergeUsefulText(old.notes, rec.notes, 180);
+            old.seed = old.seed || rec.seed;
+
+            changed = true;
+        }
+    }
+
+    if (changed) save();
+}
+
+function characterCanonLine(c) {
+    if (!c) return "";
+
+    const name = [c.title, c.name].filter(Boolean).join(" ");
+    const parts = [
+        c.identity,
+        c.faction ? `associated with ${c.faction}` : "",
+        c.marks
+    ].filter(Boolean);
+
+    if (!parts.length) return "";
+    return `${name}: ${parts.join(", ")}`;
+}
+
+function factionCanonLine(f) {
+    if (!f) return "";
+
+    const parts = [
+        f.colors ? `colors: ${f.colors}` : "",
+        f.symbols ? `symbols: ${f.symbols}` : "",
+        f.visualStyle ? `visual style: ${f.visualStyle}` : "",
+        f.notes
+    ].filter(Boolean);
+
+    if (!parts.length) return "";
+    return `${f.name}: ${parts.join(", ")}`;
+}
+
+function findRelevantMemory(action) {
+    const mem = getGameMemory();
+    const text = `${action?.title || ""}\n${action?.body || ""}\n${(action?.factions || []).join("\n")}`.toLowerCase();
+
+    const characters = [];
+    const factions = [];
+
+    for (const c of Object.values(mem.characters || {})) {
+        const rec = normalizeCharacterRecord(c);
+        const full = [rec.title, rec.name].filter(Boolean).join(" ").toLowerCase();
+        const id = rec.id.toLowerCase();
+        const nameParts = rec.name.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+
+        if (
+            text.includes(full) ||
+            text.includes(id) ||
+            nameParts.some(p => text.includes(p))
+        ) {
+            characters.push(rec);
+        }
+    }
+
+    for (const f of Object.values(mem.factions || {})) {
+        const rec = normalizeFactionRecord(f);
+        const direct = (action.factions || []).some(x => memorySafeId(x) === rec.id);
+        const mentioned = text.includes(rec.name.toLowerCase()) || text.includes(rec.id);
+
+        if (direct || mentioned) factions.push(rec);
+    }
+
+    return {
+        characters: characters.slice(0, 6),
+        factions: factions.slice(0, 6)
+    };
+}
+
+function buildCanonPromptText(action) {
+    if (!STATE.visualMemory.enabled) return "";
+
+    const relevant = findRelevantMemory(action);
+    const lines = [
+        ...relevant.characters.map(characterCanonLine).filter(Boolean),
+        ...relevant.factions.map(factionCanonLine).filter(Boolean)
+    ];
+
+    if (!lines.length) return "";
+
+    return [
+        "CANON VISUAL CONTINUITY:",
+        ...lines,
+        "Preserve stable identity traits. Clothing, pose, lighting, setting, and mood may change based on the current action."
+    ].join("\n");
+}
+
+function getPromptCacheKey(action, hints) {
+    return String(stableHash(JSON.stringify({
+        gameId: getGameId(),
+        date: action.date || "",
+        title: action.title || "",
+        body: action.body || "",
+        factions: action.factions || [],
+        positive: hints?.positivePrompt || "",
+        negative: hints?.negativePrompt || "",
+        provider: STATE.textAI.provider || "",
+        codexEnabled: STATE.visualMemory.enabled
+    })));
+}
+
+function getCachedRefinement(action, hints) {
+    if (!STATE.visualMemory.enabled) return null;
+
+    const mem = getGameMemory();
+    const key = getPromptCacheKey(action, hints);
+    return mem.promptCache?.[key]?.action || null;
+}
+
+function saveCachedRefinement(action, hints, refined) {
+    if (!STATE.visualMemory.enabled) return;
+
+    const mem = getGameMemory();
+    const key = getPromptCacheKey(action, hints);
+
+    mem.promptCache[key] = {
+        action: refined,
+        createdAt: new Date().toISOString()
+    };
+
+    const entries = Object.entries(mem.promptCache);
+
+    if (entries.length > 120) {
+        entries
+            .sort((a, b) => String(a[1]?.createdAt || "").localeCompare(String(b[1]?.createdAt || "")))
+            .slice(0, entries.length - 120)
+            .forEach(([k]) => delete mem.promptCache[k]);
+    }
+
+    save();
+}
+
+function makeRequestHeadersText(responseHeaders, name) {
+    const lines = String(responseHeaders || "").split(/\r?\n/);
+    const wanted = name.toLowerCase();
+
+    for (const line of lines) {
+        const idx = line.indexOf(":");
+        if (idx === -1) continue;
+
+        const k = line.slice(0, idx).trim().toLowerCase();
+        const v = line.slice(idx + 1).trim();
+
+        if (k === wanted) return v;
+    }
+
+    return "";
+}
+
 function ensureButton() {
     const ref = getRef();
     if (!ref) return;
 
     const existing = $("#" + BTN_ID);
+
     if (existing) {
         existing.innerText = `IMAGE GENERATION | ${STATE.engine}`;
         return;
@@ -168,164 +561,6 @@ function getActions() {
     return Array.from(document.querySelectorAll(".animate-in.fade-in.slide-in-from-top-4"));
 }
 
-function isStopped() {
-    return stopRequested;
-}
-
-function makeRequest(options) {
-    return new Promise((resolve, reject) => {
-        if (stopRequested) {
-            reject(new Error("stopped"));
-            return;
-        }
-
-        let settled = false;
-        let req = null;
-
-        const cleanup = () => {
-            if (req && typeof req.abort === "function") {
-                activeRequests.delete(req);
-            }
-        };
-
-        const finishResolve = (value) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve(value);
-        };
-
-        const finishReject = (err) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            reject(err);
-        };
-
-        req = GM_xmlhttpRequest({
-            ...options,
-            onload: r => {
-                if (stopRequested) return finishReject(new Error("stopped"));
-                if (typeof options.onload === "function") {
-                    try {
-                        const value = options.onload(r);
-                        finishResolve(value === undefined ? r : value);
-                    } catch (e) {
-                        finishReject(e);
-                    }
-                } else {
-                    finishResolve(r);
-                }
-            },
-            onerror: e => {
-                if (stopRequested) return finishReject(new Error("stopped"));
-                if (typeof options.onerror === "function") {
-                    try {
-                        const value = options.onerror(e);
-                        finishResolve(value === undefined ? e : value);
-                    } catch (err) {
-                        finishReject(err);
-                    }
-                } else {
-                    finishReject(e);
-                }
-            },
-            ontimeout: e => {
-                if (stopRequested) return finishReject(new Error("stopped"));
-                if (typeof options.ontimeout === "function") {
-                    try {
-                        const value = options.ontimeout(e);
-                        finishResolve(value === undefined ? e : value);
-                    } catch (err) {
-                        finishReject(err);
-                    }
-                } else {
-                    finishReject(new Error("timeout"));
-                }
-            },
-            onabort: () => {
-                finishReject(new Error("stopped"));
-            }
-        });
-
-        if (req && typeof req.abort === "function") {
-            activeRequests.add(req);
-        }
-    });
-}
-
-function getResponseHeader(responseHeaders, name) {
-    const lines = String(responseHeaders || "").split(/\r?\n/);
-    const wanted = name.toLowerCase();
-
-    for (const line of lines) {
-        const idx = line.indexOf(":");
-        if (idx === -1) continue;
-
-        const k = line.slice(0, idx).trim().toLowerCase();
-        const v = line.slice(idx + 1).trim();
-
-        if (k === wanted) return v;
-    }
-
-    return "";
-}
-
-function stopAllRequests() {
-    stopRequested = true;
-
-    for (const req of Array.from(activeRequests)) {
-        try {
-            req.abort();
-        } catch {}
-    }
-    activeRequests.clear();
-
-    for (const cancel of Array.from(activePollCancels)) {
-        try {
-            cancel();
-        } catch {}
-    }
-    activePollCancels.clear();
-
-    for (const u of Array.from(objectUrls)) {
-        try {
-            URL.revokeObjectURL(u);
-        } catch {}
-    }
-    objectUrls.clear();
-
-    if (observer) {
-        try {
-            observer.disconnect();
-        } catch {}
-    }
-
-    const btn = $("#" + STOP_BTN_ID);
-    if (btn) {
-        btn.textContent = "STOPPED";
-        btn.disabled = true;
-        btn.style.opacity = "0.75";
-        btn.style.cursor = "not-allowed";
-    }
-}
-
-function resetStopState() {
-    stopRequested = false;
-    const btn = $("#" + STOP_BTN_ID);
-    if (btn) {
-        btn.textContent = "STOP";
-        btn.disabled = false;
-        btn.style.opacity = "";
-        btn.style.cursor = "";
-    }
-    if (observer) {
-        try {
-            observer.observe(document.body, { childList: true, subtree: true });
-        } catch {}
-    }
-}
-
 function extract(card) {
     const date =
         card.querySelector(".inline-flex.items-center.rounded-md")
@@ -346,7 +581,7 @@ function extract(card) {
 }
 
 function signature(a) {
-    return [a.date, a.title, a.body].join("::").slice(0, 400);
+    return [getGameId(), a.date, a.title, a.body].join("::").slice(0, 700);
 }
 
 function getWorkflow() {
@@ -367,15 +602,14 @@ function extractWorkflowPromptHints(workflow) {
 
     for (const node of Object.values(workflow || {})) {
         if (node?.class_type !== "CLIPTextEncode") continue;
+
         const text = typeof node?.inputs?.text === "string" ? node.inputs.text.trim() : "";
         if (!text) continue;
 
         const title = String(node?._meta?.title || "").toLowerCase();
         const isNegative = title.includes("negative");
-        const isPositive = title.includes("positive") || (!isNegative && !positives.length);
 
         if (isNegative) negatives.push(text);
-        else if (isPositive) positives.push(text);
         else positives.push(text);
     }
 
@@ -388,9 +622,8 @@ function extractWorkflowPromptHints(workflow) {
 function compressAction(body) {
     if (!body) return "";
 
-    let text = body.replace(/\s+/g, " ").trim();
+    const text = body.replace(/\s+/g, " ").trim();
     const sentences = text.split(/(?<=[.!?])\s+/);
-
     const visual = [];
 
     for (const s of sentences) {
@@ -414,219 +647,120 @@ function compressAction(body) {
     return visual.join(" ");
 }
 
-function hasLikelyHumanCue(action) {
-    const text = `${action?.title || ""} ${action?.body || ""} ${(action?.factions || []).join(" ")}`;
-
-    if (/\b(king|queen|prince|princess|emperor|empress|president|prime minister|minister|general|commander|admiral|captain|soldier|officer|leader|ambassador|chancellor|governor|duke|duchess|lord|lady|man|woman|boy|girl|person|ruler|warrior|pilot|spy|agent)\b/i.test(text)) {
-        return true;
-    }
-
-    if (/\b[A-Z][a-z]+ [A-Z][a-z]+\b/.test(text)) {
-        return true;
-    }
-
-    return false;
-}
-
 function inferContextualTags(action) {
     const text = `${action?.title || ""} ${action?.body || ""} ${(action?.factions || []).join(" ")}`.toLowerCase();
     const tags = [];
 
-    const human = hasLikelyHumanCue(action);
-
-    if (human) {
-        tags.push(
-            "highly detailed character design",
-            "realistic facial features",
-            "detailed clothing",
-            "anatomically accurate"
-        );
+    if (/\b(person|people|leader|ruler|soldier|officer|diplomat|commander|minister|king|queen|president|emperor|general|captain|agent|spy|warrior|pilot)\b/i.test(text)) {
+        tags.push("detailed human subject", "realistic facial features", "period-accurate clothing");
     }
 
     if (/\b(military|army|soldier|battle|war|frontline|trench|tank|rifle|artillery|airstrike|combat|invasion|occupation|campaign)\b/i.test(text)) {
-        tags.push(
-            "military realism",
-            "authentic uniforms",
-            "detailed gear",
-            "battlefield atmosphere"
-        );
+        tags.push("military realism", "authentic uniforms", "battlefield atmosphere");
     }
 
-    if (/\b(palace|throne|king|queen|emperor|royal|noble|court)\b/i.test(text)) {
-        tags.push(
-            "regal attire",
-            "ornate interior",
-            "luxurious materials"
-        );
+    if (/\b(palace|throne|royal|noble|court)\b/i.test(text)) {
+        tags.push("regal attire", "ornate interior");
     }
 
     if (/\b(diplomat|diplomatic|negotiation|treaty|summit|parliament|senate|congress|council|meeting|conference)\b/i.test(text)) {
-        tags.push(
-            "formal interior",
-            "document detail",
-            "serious political atmosphere"
-        );
+        tags.push("formal interior", "serious political atmosphere");
     }
 
     if (/\b(city|street|village|town|capital|market|crowd|protest|riot|square)\b/i.test(text)) {
-        tags.push(
-            "urban environment detail",
-            "crowd realism",
-            "street-level atmosphere"
-        );
+        tags.push("urban environment detail", "street-level atmosphere");
     }
 
     if (/\b(fire|smoke|explosion|burning|ruins|wreckage|debris)\b/i.test(text)) {
-        tags.push(
-            "smoke and debris",
-            "dramatic destruction",
-            "chaotic aftermath"
-        );
-    }
-
-    if (/\b(desert|snow|rain|fog|storm|night|dawn|sunset)\b/i.test(text)) {
-        tags.push(
-            "weather realism",
-            "atmospheric lighting"
-        );
+        tags.push("smoke and debris", "dramatic destruction");
     }
 
     return [...new Set(tags)];
 }
 
 function buildTextAIPrompt(action, hints) {
+    const canon = buildCanonPromptText(action);
     const positiveTags = hints?.positivePrompt || "";
     const negativeTags = hints?.negativePrompt || "";
 
     return `
-You are a VISUAL WORLD-TO-IMAGE TRANSLATION ENGINE.
+You convert Pax Historia actions into a single Stable Diffusion / ComfyUI image prompt.
 
-Your job is NOT summarization.
+You also maintain an automatic Campaign Codex for visual consistency.
 
-Your job is to convert text into a FULLY VISUAL, HIGHLY DETAILED image prompt for Stable Diffusion / ComfyUI.
+IMPORTANT:
+- The script contains NO hardcoded titles, countries, eras, roles, or factions.
+- You must interpret the preset/game context from the input only.
+- You must provide canonicalId values for merging.
+- canonicalId should be stable, lowercase, and title-free when possible.
+- For people, canonicalId should usually be the stable personal name, not a rank/title/sentence.
+- For factions, canonicalId should be the stable faction/entity name.
+- Do not create Codex entries for temporary outfits, pose, lighting, mood, locations, operations, commands, plans, sentences, or one-time scene details.
+- Clothing/outfit should go in the prompt only unless it is a permanent identity trait.
 
-========================
-CRITICAL RULE
-========================
-If the input lacks visual detail, you MUST invent plausible detail from context.
+Existing Codex canon:
+${canon || "(none)"}
 
-Never output vague prompts like:
-- "NAME does such and such"
-- "the leader speaks"
-- "the general reacts"
-
-Instead, ALWAYS expand into a concrete scene with visible detail:
-- appearance
-- age range
-- facial structure
-- hair
-- clothing
-- posture
-- props
-- environment
-- lighting
-- mood shown physically, not abstractly
-
-========================
-CHARACTER RULE
-========================
-If a person, leader, named figure, or human-like subject is present or implied, you MUST automatically infer:
-- age range
-- likely ethnicity or regional appearance based on context, not stereotypes
-- facial structure
-- hair style and condition
-- skin texture
-- clothing appropriate to role, era, faction, or setting
-- visible posture and expression
-- relevant gear, insignia, tools, documents, weapons, or accessories
-
-Never leave a named person as just a name.
-
-========================
-DETAIL ENRICHMENT RULE
-========================
-When detail is missing, fill it in with contextually plausible specifics so the image generator has something to work with.
-
-Examples of acceptable enrichment:
-- "stern middle-aged war general in a decorated uniform"
-- "tired civilian leader in a dim war room"
-- "dust-covered messenger running through a ruined street"
-- "crowded diplomatic chamber with flags, maps, and documents"
-
-========================
-STYLE TAG RULE
-========================
-If the scene contains a person, include people-focused realism tags such as:
-- highly detailed character design
-- realistic facial features
-- detailed clothing
-- anatomically accurate
-
-If the scene does NOT contain a person, do NOT force human anatomy tags.
-
-========================
-WORKFLOW STYLE TAGS
-========================
-Include these exact positive style tags verbatim in the final prompt if present:
+Workflow positive tags to include if present:
 ${positiveTags || "(none)"}
 
-Respect these negative constraints:
+Negative constraints to respect:
 ${negativeTags || "(none)"}
 
-========================
-OUTPUT FORMAT
-========================
-Return ONLY valid JSON in this exact shape:
+Return ONLY this JSON:
 {
-  "prompt": "string",
-  "title": "string",
-  "factions": ["string"]
+  "prompt": "one clean cinematic image prompt",
+  "title": "short image title",
+  "factions": ["visible faction names only"],
+  "codex": {
+    "characters": [
+      {
+        "canonicalId": "stable lowercase identity key",
+        "name": "actual recurring character name only",
+        "title": "stable title or role if known from the input",
+        "faction": "stable allegiance if known from the input",
+        "identity": "stable face/age/hair/build/skin/recognizable identity traits only",
+        "marks": "stable scars, facial hair, eyewear, emblem, or other permanent visual identifiers only"
+      }
+    ],
+    "factions": [
+      {
+        "canonicalId": "stable lowercase faction key",
+        "name": "recurring faction name",
+        "colors": "stable faction colors only",
+        "symbols": "stable flags, emblems, insignia only",
+        "visualStyle": "stable architecture, vehicle, equipment, or design language only",
+        "notes": "other stable visual identity notes only"
+      }
+    ]
+  }
 }
 
-========================
-PROMPT CONSTRUCTION RULE
-========================
-The prompt must be built like this internally:
+Rules:
+- Fully automate useful Codex updates when a recurring character or faction is visible or important.
+- Do not include generic filler like "consistent face", "detailed clothing", or "cinematic realism" in Codex fields.
+- Character entries must be actual people, not operations, commands, actions, locations, committees, plans, or sentences.
+- If unsure whether a name is a person or faction, omit it.
+- Outfit and clothing should go in the prompt only, not the Codex.
+- The prompt should freely adapt outfit, pose, lighting, environment, and mood to this specific action.
+- No hardcoded countries, periods, or historical assumptions unless present in the input.
+- No metadata, timestamps, source fields, cache fields, seed numbers, or internal notes.
+- Existing Codex identity traits override your creativity.
 
-[SUBJECT - fully described]
-+ [ACTION - physically visible]
-+ [ENVIRONMENT - detailed and drawable]
-+ [CHARACTER DESIGN - only if a human is present]
-+ [CAMERA - cinematic framing]
-+ [LIGHTING - physical lighting]
-+ [STYLE - cinematic realism]
-
-========================
-VISUAL PRIORITY RULES
-========================
-- Prioritize what a camera could capture in a single frame
-- Remove anything invisible or abstract
-- Convert abstract ideas into visible imagery
-- Replace weak nouns with concrete visual equivalents
-- If a person is only named, invent a believable visual identity from context
-
-========================
-INPUT
-========================
+Input:
 Date: ${action.date}
 Title: ${action.title}
 Body: ${action.body}
 Factions: ${(action.factions || []).join(", ")}
-
-========================
-FINAL REQUIREMENT
-========================
-Return ONE ultra-detailed cinematic prompt suitable for image generation.
-${positiveTags ? `\nImportant: preserve these exact positive tags verbatim somewhere in the prompt: ${positiveTags}` : ""}
 `;
 }
 
 async function callOpenRouter(prompt) {
     const cfg = STATE.textAI.openrouter;
-
     if (!cfg.apiKey) throw new Error("Missing OpenRouter API key");
 
     const now = Date.now();
+
     if (openRouterCooldownUntil && now < openRouterCooldownUntil) {
         throw new Error(`OpenRouter cooldown active for ${Math.ceil((openRouterCooldownUntil - now) / 1000)}s`);
     }
@@ -645,23 +779,23 @@ async function callOpenRouter(prompt) {
             messages: [
                 {
                     role: "system",
-                    content: "You return JSON only."
+                    content: "Return JSON only. Maintain automatic visual identity fields only. Do not rely on hardcoded presets. No metadata."
                 },
                 {
                     role: "user",
                     content: prompt
                 }
             ],
-            temperature: 0.4
+            temperature: 0.2
         }),
         timeout: 30000
     });
 
     if (r.status === 429) {
-        const retryAfter = parseInt(getResponseHeader(r.responseHeaders, "retry-after"), 10);
+        const retryAfter = parseInt(makeRequestHeadersText(r.responseHeaders, "retry-after"), 10);
         const cooldownMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 45000;
         openRouterCooldownUntil = Date.now() + cooldownMs;
-        throw new Error(`OpenRouter 429 rate limited; cooling down for ${Math.ceil(cooldownMs / 1000)}s`);
+        throw new Error(`OpenRouter 429 rate limited`);
     }
 
     if (r.status < 200 || r.status >= 300) {
@@ -676,13 +810,8 @@ async function callOpenAICompatible(prompt) {
     const cfg = STATE.textAI.openaiCompatible;
     const endpoint = normalizeCompatibleEndpoint(cfg.endpoint);
 
-    const headers = {
-        "Content-Type": "application/json"
-    };
-
-    if (cfg.apiKey) {
-        headers.Authorization = `Bearer ${cfg.apiKey}`;
-    }
+    const headers = { "Content-Type": "application/json" };
+    if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
 
     const r = await makeRequest({
         method: "POST",
@@ -693,14 +822,14 @@ async function callOpenAICompatible(prompt) {
             messages: [
                 {
                     role: "system",
-                    content: "You return JSON only."
+                    content: "Return JSON only. Maintain automatic visual identity fields only. Do not rely on hardcoded presets. No metadata."
                 },
                 {
                     role: "user",
                     content: prompt
                 }
             ],
-            temperature: 0.4
+            temperature: 0.2
         }),
         timeout: 30000
     });
@@ -715,32 +844,54 @@ async function callOpenAICompatible(prompt) {
 
 function normalizeCompatibleEndpoint(endpoint) {
     let e = String(endpoint || "").trim();
+
     if (!e) return "http://127.0.0.1:1234/v1/chat/completions";
     if (e.endsWith("/chat/completions")) return e;
     if (e.endsWith("/v1")) return `${e}/chat/completions`;
     if (e.endsWith("/")) return `${e}v1/chat/completions`;
+
     return `${e}/v1/chat/completions`;
 }
 
 function stripCodeFences(text) {
-    return (text || "").replace(/```json|```/g, "").trim();
+    return String(text || "").replace(/```json|```/g, "").trim();
 }
 
 function extractJSONObject(text) {
     const cleaned = stripCodeFences(text);
     const first = cleaned.indexOf("{");
     const last = cleaned.lastIndexOf("}");
-    if (first !== -1 && last !== -1 && last > first) return cleaned.slice(first, last + 1);
+
+    if (first !== -1 && last !== -1 && last > first) {
+        return cleaned.slice(first, last + 1);
+    }
+
     return cleaned;
+}
+
+function sanitizeGeneratedPrompt(prompt) {
+    return String(prompt || "")
+        .replace(/\{[\s\S]*?\}/g, "")
+        .replace(/\bconsistent face\b/gi, "")
+        .replace(/\bcreatedAt\b|\bupdatedAt\b|\bsource\b|\bseed\b|\bstatus\b|\bcache\b/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 async function refineActionWithTextAI(action, hints) {
     if (stopRequested) return action;
-    if (!STATE.textAI.provider) return action;
 
-    const prompt = buildTextAIPrompt(action, hints);
+    const cached = getCachedRefinement(action, hints);
+    if (cached) return cached;
+
+    if (!STATE.textAI.provider) {
+        const fallback = enhanceRawActionWithCanon(action);
+        saveCachedRefinement(action, hints, fallback);
+        return fallback;
+    }
 
     try {
+        const prompt = buildTextAIPrompt(action, hints);
         let raw = "";
 
         if (STATE.textAI.provider === "openrouter") {
@@ -748,59 +899,62 @@ async function refineActionWithTextAI(action, hints) {
         } else if (STATE.textAI.provider === "openai-compatible") {
             raw = await callOpenAICompatible(prompt);
         } else {
-            return action;
+            return enhanceRawActionWithCanon(action);
         }
 
         if (stopRequested) return action;
 
-        const cleaned = extractJSONObject(raw);
-        const parsed = JSON.parse(cleaned);
+        const parsed = JSON.parse(extractJSONObject(raw));
+        addTextAICodex(parsed);
 
-        return {
+        const refined = {
             ...action,
-            title: parsed.title || action.title,
-            factions: Array.isArray(parsed.factions) ? parsed.factions : action.factions,
-            body: parsed.prompt || action.body
+            title: sanitizeGeneratedPrompt(parsed.title || action.title),
+            factions: Array.isArray(parsed.factions) ? parsed.factions.map(normalizeText).filter(Boolean).slice(0, 4) : action.factions,
+            body: sanitizeGeneratedPrompt(parsed.prompt || action.body)
         };
 
+        saveCachedRefinement(action, hints, refined);
+        return refined;
     } catch (e) {
-        if (!stopRequested) {
-            console.warn("Text AI failed, fallback to raw action:", e);
-        }
-        return action;
+        if (!stopRequested) console.warn("Text AI failed, fallback to raw action:", e);
+
+        const fallback = enhanceRawActionWithCanon(action);
+        saveCachedRefinement(action, hints, fallback);
+        return fallback;
     }
+}
+
+function enhanceRawActionWithCanon(action) {
+    const canon = buildCanonPromptText(action);
+    if (!canon) return action;
+
+    return {
+        ...action,
+        body: `${action.body || ""}\n\n${canon}`.trim()
+    };
 }
 
 function buildPrompt(action, hints) {
     const visual = compressAction(action.body);
+    const canon = buildCanonPromptText(action);
 
     let factions = action.factions || [];
+    factions = factions.filter(f => !/^god$/i.test(f)).slice(0, 4);
 
-    const blacklist = new Set(["God", "god", "GOD"]);
-
-    factions = factions
-        .filter(f => !blacklist.has(f))
-        .slice(0, 4);
-
-    const factionText = factions.length
-        ? factions.join(", ") + "."
-        : "";
-
-    const title = (action.title || "")
-        .replace(/['"]/g, "")
-        .slice(0, 120);
-
+    const factionText = factions.length ? `${factions.join(", ")}.` : "";
+    const title = normalizeText(action.title).slice(0, 120);
     const styleTags = hints?.positivePrompt || "";
     const inferredTags = inferContextualTags(action).join(", ");
 
     return [
-        action.date ? action.date + "." : "",
+        action.date ? `${action.date}.` : "",
         factionText,
         title,
         visual,
+        canon,
         inferredTags,
         styleTags,
-        "",
         "cinematic wide shot",
         "realistic environment",
         "high detail",
@@ -808,6 +962,48 @@ function buildPrompt(action, hints) {
     ]
     .filter(Boolean)
     .join("\n");
+}
+
+function pickCanonicalSeed(action) {
+    if (!STATE.visualMemory.enabled) return null;
+
+    const relevant = findRelevantMemory(action);
+
+    if (relevant.characters.length && relevant.characters[0]?.seed) {
+        return Number(relevant.characters[0].seed);
+    }
+
+    if (relevant.factions.length && relevant.factions[0]?.seed) {
+        return Number(relevant.factions[0].seed);
+    }
+
+    if (action?.factions?.length) {
+        return stableHash(`${getGameId()}::${action.factions[0]}`);
+    }
+
+    return stableHash(`${getGameId()}::${action?.title || ""}`);
+}
+
+function applySeedToWorkflow(wf, seed) {
+    if (!Number.isFinite(seed)) return;
+
+    const normalizedSeed = Math.max(1, Math.floor(seed) % 2147483647);
+
+    for (const node of Object.values(wf || {})) {
+        if (!node?.inputs || !node?.class_type) continue;
+
+        const type = String(node.class_type).toLowerCase();
+
+        if (
+            type.includes("ksampler") ||
+            type.includes("sampler") ||
+            Object.prototype.hasOwnProperty.call(node.inputs, "seed") ||
+            Object.prototype.hasOwnProperty.call(node.inputs, "noise_seed")
+        ) {
+            if (Object.prototype.hasOwnProperty.call(node.inputs, "seed")) node.inputs.seed = normalizedSeed;
+            if (Object.prototype.hasOwnProperty.call(node.inputs, "noise_seed")) node.inputs.noise_seed = normalizedSeed;
+        }
+    }
 }
 
 function buildWorkflow(action) {
@@ -824,26 +1020,23 @@ function buildWorkflow(action) {
         if (!node?.class_type) continue;
 
         if (node.class_type === "CLIPTextEncode" && node.inputs) {
-            const text = node.inputs.text;
             const title = String(node?._meta?.title || "").toLowerCase();
-
             const isNegative = title.includes("negative");
             const isPositive = title.includes("positive") || !isNegative;
 
-            if (isPositive && typeof text === "string") {
+            if (isPositive && typeof node.inputs.text === "string") {
                 targetNode = node;
                 break;
             }
         }
     }
 
-    if (!targetNode && wf["6"]?.inputs?.text !== undefined) {
-        targetNode = wf["6"];
-    }
-
+    if (!targetNode && wf["6"]?.inputs?.text !== undefined) targetNode = wf["6"];
     if (!targetNode) return null;
 
     targetNode.inputs.text = prompt;
+
+    applySeedToWorkflow(wf, pickCanonicalSeed(action));
 
     return wf;
 }
@@ -861,14 +1054,7 @@ function buildViewUrl(img) {
 
     url.searchParams.set("filename", img?.filename || "");
     url.searchParams.set("type", img?.type || "output");
-
-    const subfolder =
-        img?.subfolder === null ||
-        img?.subfolder === undefined
-            ? ""
-            : String(img.subfolder);
-
-    url.searchParams.set("subfolder", subfolder);
+    url.searchParams.set("subfolder", img?.subfolder == null ? "" : String(img.subfolder));
 
     return url.toString();
 }
@@ -978,9 +1164,7 @@ function pollResult(promptId) {
                 console.warn("ComfyUI poll tick failed:", e);
             }
 
-            if (tries > 60) {
-                return finishReject(new Error("timeout"));
-            }
+            if (tries > 60) return finishReject(new Error("timeout"));
 
             timer = setTimeout(tick, 2000);
         };
@@ -1048,9 +1232,7 @@ function openViewer(url) {
 }
 
 function attachInline(card, preview) {
-    if (preview.parentElement !== card) {
-        card.appendChild(preview);
-    }
+    if (preview.parentElement !== card) card.appendChild(preview);
 }
 
 function styleField(el) {
@@ -1079,9 +1261,13 @@ function styleButton(el, variant = "default") {
         color: "#fff",
         background: variant === "danger"
             ? "rgba(160,50,60,0.95)"
-            : variant === "muted"
-                ? "rgba(255,255,255,0.10)"
-                : "rgb(40,20,60)"
+            : variant === "start"
+                ? "rgba(45,130,75,0.95)"
+                : variant === "gold"
+                    ? "rgba(150,105,35,0.95)"
+                    : variant === "muted"
+                        ? "rgba(255,255,255,0.10)"
+                        : "rgb(40,20,60)"
     });
 }
 
@@ -1238,6 +1424,567 @@ function renderTextAISection(container) {
     container.appendChild(fields);
 }
 
+function field(labelText, value, oninput, placeholder = "") {
+    const wrap = document.createElement("label");
+    Object.assign(wrap.style, {
+        display: "block",
+        fontSize: "12px",
+        opacity: "0.95"
+    });
+
+    const label = document.createElement("div");
+    label.textContent = labelText;
+    Object.assign(label.style, {
+        marginBottom: "4px",
+        fontWeight: "700"
+    });
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = placeholder;
+    input.value = value || "";
+    styleField(input);
+    input.oninput = e => oninput(e.target.value);
+
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    return wrap;
+}
+
+function textareaField(labelText, value, oninput, placeholder = "") {
+    const wrap = document.createElement("label");
+    Object.assign(wrap.style, {
+        display: "block",
+        fontSize: "12px",
+        opacity: "0.95"
+    });
+
+    const label = document.createElement("div");
+    label.textContent = labelText;
+    Object.assign(label.style, {
+        marginBottom: "4px",
+        fontWeight: "700"
+    });
+
+    const input = document.createElement("textarea");
+    input.placeholder = placeholder;
+    input.value = value || "";
+
+    Object.assign(input.style, {
+        width: "100%",
+        boxSizing: "border-box",
+        minHeight: "68px",
+        padding: "10px 12px",
+        borderRadius: "10px",
+        border: "1px solid rgba(255,255,255,0.10)",
+        background: "rgba(255,255,255,0.06)",
+        color: "#fff",
+        outline: "none",
+        fontSize: "13px",
+        marginBottom: "8px",
+        resize: "vertical"
+    });
+
+    input.oninput = e => oninput(e.target.value);
+
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    return wrap;
+}
+
+function openCodex() {
+    let existing = $("#" + CODEX_MODAL_ID);
+    if (existing) existing.remove();
+
+    const mem = getGameMemory();
+
+    const m = document.createElement("div");
+    m.id = CODEX_MODAL_ID;
+
+    Object.assign(m.style, {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.74)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 1000000
+    });
+
+    const box = document.createElement("div");
+    Object.assign(box.style, {
+        width: "1040px",
+        maxWidth: "96vw",
+        maxHeight: "92vh",
+        overflow: "auto",
+        background: "linear-gradient(180deg, rgba(35,35,40,0.98), rgba(22,22,26,0.98))",
+        color: "#fff",
+        padding: "18px",
+        borderRadius: "16px",
+        boxShadow: "0 25px 80px rgba(0,0,0,0.45)",
+        fontSize: "13px",
+        border: "1px solid rgba(255,255,255,0.08)"
+    });
+
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+        display: "flex",
+        justifyContent: "space-between",
+        gap: "12px",
+        alignItems: "center",
+        marginBottom: "12px",
+        flexWrap: "wrap"
+    });
+
+    const title = document.createElement("div");
+    title.innerHTML = `<div style="font-size:20px;font-weight:800;">Campaign Codex</div><div style="opacity:.8;font-size:12px;">Game ${getGameId()} — automatic visual identity memory. Edit only to clean or fix.</div>`;
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "Close";
+    styleButton(close, "muted");
+    close.onclick = () => m.remove();
+
+    header.appendChild(title);
+    header.appendChild(close);
+
+    const tabs = document.createElement("div");
+    Object.assign(tabs.style, {
+        display: "flex",
+        gap: "8px",
+        marginBottom: "12px",
+        flexWrap: "wrap"
+    });
+
+    const content = document.createElement("div");
+    let activeTab = "characters";
+    const tabButtons = {};
+
+    function makeTab(name, label) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = label;
+        styleButton(b, name === activeTab ? "gold" : "muted");
+        b.onclick = () => {
+            activeTab = name;
+            render();
+        };
+        tabButtons[name] = b;
+        tabs.appendChild(b);
+    }
+
+    makeTab("characters", "Characters");
+    makeTab("factions", "Factions");
+    makeTab("cleanup", "Cleanup");
+
+    function refreshTabs() {
+        for (const [name, b] of Object.entries(tabButtons)) {
+            styleButton(b, name === activeTab ? "gold" : "muted");
+        }
+    }
+
+    function renderCardShell() {
+        const grid = document.createElement("div");
+        Object.assign(grid.style, {
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+            gap: "12px"
+        });
+        return grid;
+    }
+
+    function characterCard(c) {
+        const card = document.createElement("div");
+        styleSection(card);
+        Object.assign(card.style, { marginBottom: "0" });
+
+        const top = document.createElement("div");
+        Object.assign(top.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "8px",
+            marginBottom: "10px"
+        });
+
+        const name = document.createElement("div");
+        name.textContent = [c.title, c.name].filter(Boolean).join(" ") || "Unnamed";
+        Object.assign(name.style, {
+            fontWeight: "800",
+            fontSize: "15px"
+        });
+
+        top.appendChild(name);
+        card.appendChild(top);
+
+        card.appendChild(field("Canonical ID", c.canonicalId || c.id, v => {
+            const oldId = c.id;
+            const nextId = memorySafeId(v);
+            if (!nextId) return;
+
+            c.id = nextId;
+            c.canonicalId = nextId;
+
+            if (nextId !== oldId && !mem.characters[nextId]) {
+                delete mem.characters[oldId];
+                mem.characters[nextId] = c;
+            }
+
+            save();
+        }, "stable merge key"));
+
+        card.appendChild(field("Name", c.name, v => {
+            c.name = titleCaseLoose(v);
+            save();
+        }, "Character name"));
+
+        card.appendChild(field("Stable Title / Role", c.title, v => {
+            c.title = normalizeText(v);
+            save();
+        }, "Whatever the game/AI calls this role"));
+
+        card.appendChild(field("Stable Faction / Allegiance", c.faction, v => {
+            c.faction = normalizeText(v);
+            save();
+        }, "Faction or allegiance"));
+
+        card.appendChild(textareaField("Stable Identity", c.identity, v => {
+            c.identity = normalizeText(v);
+            save();
+        }, "Face, age range, hair, build, complexion, permanent identity traits"));
+
+        card.appendChild(textareaField("Stable Marks / Identifiers", c.marks, v => {
+            c.marks = normalizeText(v);
+            save();
+        }, "Scars, facial hair, eyewear, emblem, other permanent identifiers"));
+
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            marginTop: "6px"
+        });
+
+        const merge = document.createElement("button");
+        merge.type = "button";
+        merge.textContent = "Merge Into ID...";
+        styleButton(merge, "muted");
+        merge.onclick = () => {
+            const targetIdRaw = prompt("Merge this character into which existing Canonical ID?");
+            if (!targetIdRaw) return;
+
+            const targetId = memorySafeId(targetIdRaw);
+            if (!targetId || !mem.characters[targetId]) {
+                alert("No matching character found.");
+                return;
+            }
+
+            const target = mem.characters[targetId];
+            target.name = target.name || c.name;
+            target.title = target.title || c.title;
+            target.faction = target.faction || c.faction;
+            target.identity = mergeUsefulText(target.identity, c.identity);
+            target.marks = mergeUsefulText(target.marks, c.marks);
+
+            delete mem.characters[c.id];
+            save();
+            render();
+        };
+
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "Delete";
+        styleButton(del, "danger");
+        del.onclick = () => {
+            if (!confirm(`Delete ${c.name}?`)) return;
+            delete mem.characters[c.id];
+            save();
+            render();
+        };
+
+        row.appendChild(merge);
+        row.appendChild(del);
+
+        card.appendChild(row);
+
+        return card;
+    }
+
+    function factionCard(f) {
+        const card = document.createElement("div");
+        styleSection(card);
+        Object.assign(card.style, { marginBottom: "0" });
+
+        const top = document.createElement("div");
+        Object.assign(top.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: "8px",
+            marginBottom: "10px"
+        });
+
+        const name = document.createElement("div");
+        name.textContent = f.name || "Unnamed faction";
+        Object.assign(name.style, {
+            fontWeight: "800",
+            fontSize: "15px"
+        });
+
+        top.appendChild(name);
+        card.appendChild(top);
+
+        card.appendChild(field("Canonical ID", f.canonicalId || f.id, v => {
+            const oldId = f.id;
+            const nextId = memorySafeId(v);
+            if (!nextId) return;
+
+            f.id = nextId;
+            f.canonicalId = nextId;
+
+            if (nextId !== oldId && !mem.factions[nextId]) {
+                delete mem.factions[oldId];
+                mem.factions[nextId] = f;
+            }
+
+            save();
+        }, "stable merge key"));
+
+        card.appendChild(field("Faction Name", f.name, v => {
+            f.name = normalizeText(v);
+            save();
+        }, "Faction name"));
+
+        card.appendChild(field("Stable Colors", f.colors, v => {
+            f.colors = normalizeText(v);
+            save();
+        }, "Recurring colors"));
+
+        card.appendChild(field("Stable Symbols", f.symbols, v => {
+            f.symbols = normalizeText(v);
+            save();
+        }, "Flags, emblems, insignia"));
+
+        card.appendChild(textareaField("Stable Visual Style", f.visualStyle, v => {
+            f.visualStyle = normalizeText(v);
+            save();
+        }, "Architecture, vehicles, equipment, design language"));
+
+        card.appendChild(textareaField("Notes", f.notes, v => {
+            f.notes = normalizeText(v);
+            save();
+        }, "Other stable faction identity notes"));
+
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            marginTop: "6px"
+        });
+
+        const del = document.createElement("button");
+        del.type = "button";
+        del.textContent = "Delete";
+        styleButton(del, "danger");
+        del.onclick = () => {
+            if (!confirm(`Delete ${f.name}?`)) return;
+            delete mem.factions[f.id];
+            save();
+            render();
+        };
+
+        row.appendChild(del);
+        card.appendChild(row);
+
+        return card;
+    }
+
+    function renderCharacters() {
+        const wrap = document.createElement("div");
+
+        const controls = document.createElement("div");
+        Object.assign(controls.style, {
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            marginBottom: "12px"
+        });
+
+        const add = document.createElement("button");
+        add.type = "button";
+        add.textContent = "Add Character";
+        styleButton(add, "gold");
+        add.onclick = () => {
+            const name = prompt("Character name?");
+            if (!name) return;
+
+            const id = memorySafeId(name);
+            if (!id) return;
+
+            mem.characters[id] = normalizeCharacterRecord({
+                id,
+                canonicalId: id,
+                name,
+                seed: stableHash(`${getGameId()}::character::${id}`)
+            });
+
+            save();
+            render();
+        };
+
+        controls.appendChild(add);
+        wrap.appendChild(controls);
+
+        const grid = renderCardShell();
+        const chars = Object.values(mem.characters).map(normalizeCharacterRecord)
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        if (!chars.length) {
+            const empty = document.createElement("div");
+            empty.textContent = STATE.textAI.provider
+                ? "No characters stored yet. Text AI will automatically add stable recurring identities as actions generate."
+                : "No characters stored yet. Enable Text AI for automatic identity memory, or add characters manually.";
+            Object.assign(empty.style, { opacity: "0.8", padding: "12px" });
+            wrap.appendChild(empty);
+            return wrap;
+        }
+
+        for (const c of chars) grid.appendChild(characterCard(c));
+        wrap.appendChild(grid);
+        return wrap;
+    }
+
+    function renderFactions() {
+        const wrap = document.createElement("div");
+
+        const controls = document.createElement("div");
+        Object.assign(controls.style, {
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap",
+            marginBottom: "12px"
+        });
+
+        const add = document.createElement("button");
+        add.type = "button";
+        add.textContent = "Add Faction";
+        styleButton(add, "gold");
+        add.onclick = () => {
+            const name = prompt("Faction name?");
+            if (!name) return;
+
+            const id = memorySafeId(name);
+
+            mem.factions[id] = normalizeFactionRecord({
+                id,
+                canonicalId: id,
+                name,
+                seed: stableHash(`${getGameId()}::faction::${id}`)
+            });
+
+            save();
+            render();
+        };
+
+        controls.appendChild(add);
+        wrap.appendChild(controls);
+
+        const grid = renderCardShell();
+        const factions = Object.values(mem.factions).map(normalizeFactionRecord)
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        if (!factions.length) {
+            const empty = document.createElement("div");
+            empty.textContent = STATE.textAI.provider
+                ? "No factions stored yet. Text AI will automatically add recurring faction identities as actions generate."
+                : "No factions stored yet. Enable Text AI for automatic faction memory, or add factions manually.";
+            Object.assign(empty.style, { opacity: "0.8", padding: "12px" });
+            wrap.appendChild(empty);
+            return wrap;
+        }
+
+        for (const f of factions) grid.appendChild(factionCard(f));
+        wrap.appendChild(grid);
+        return wrap;
+    }
+
+    function renderCleanup() {
+        const wrap = document.createElement("div");
+        styleSection(wrap);
+
+        const info = document.createElement("div");
+        info.innerHTML = `
+            <div style="font-weight:800;font-size:15px;margin-bottom:8px;">Codex Maintenance</div>
+            <div style="opacity:.82;line-height:1.45;margin-bottom:12px;">
+                The Codex is fully automatic when Text AI is enabled. Use this only for cleanup, merges, and fixes.
+            </div>
+        `;
+
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+            display: "flex",
+            gap: "8px",
+            flexWrap: "wrap"
+        });
+
+        const clearCache = document.createElement("button");
+        clearCache.type = "button";
+        clearCache.textContent = "Clear Prompt Cache";
+        styleButton(clearCache, "muted");
+        clearCache.onclick = () => {
+            mem.promptCache = {};
+            save();
+            alert("Prompt cache cleared.");
+        };
+
+        const clearAll = document.createElement("button");
+        clearAll.type = "button";
+        clearAll.textContent = "Clear Entire Game Codex";
+        styleButton(clearAll, "danger");
+        clearAll.onclick = () => {
+            if (!confirm("Clear the entire Campaign Codex for this game?")) return;
+            delete STATE.visualMemory.games[getGameId()];
+            save();
+            m.remove();
+            openCodex();
+        };
+
+        row.appendChild(clearCache);
+        row.appendChild(clearAll);
+
+        wrap.appendChild(info);
+        wrap.appendChild(row);
+
+        return wrap;
+    }
+
+    function render() {
+        normalizeState();
+        refreshTabs();
+        content.innerHTML = "";
+
+        if (activeTab === "characters") content.appendChild(renderCharacters());
+        if (activeTab === "factions") content.appendChild(renderFactions());
+        if (activeTab === "cleanup") content.appendChild(renderCleanup());
+    }
+
+    function refreshTabs() {
+        for (const [name, b] of Object.entries(tabButtons)) {
+            styleButton(b, name === activeTab ? "gold" : "muted");
+        }
+    }
+
+    box.appendChild(header);
+    box.appendChild(tabs);
+    box.appendChild(content);
+    m.appendChild(box);
+    document.body.appendChild(m);
+
+    render();
+}
+
 async function testComfyUIConnection() {
     try {
         const r = await makeRequest({
@@ -1248,7 +1995,7 @@ async function testComfyUIConnection() {
 
         if (r.status >= 200 && r.status < 300) return "ComfyUI: OK";
         return `ComfyUI: FAIL (${r.status})`;
-    } catch (e) {
+    } catch {
         if (stopRequested) return "ComfyUI: STOPPED";
         return "ComfyUI: FAIL";
     }
@@ -1281,14 +2028,7 @@ async function testOpenRouterConnection() {
         });
 
         if (r.status >= 200 && r.status < 300) return "Text AI (OpenRouter): OK";
-
-        if (r.status === 429) {
-            const retryAfter = parseInt(getResponseHeader(r.responseHeaders, "retry-after"), 10);
-            const cooldownMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 45000;
-            openRouterCooldownUntil = Date.now() + cooldownMs;
-            return `Text AI (OpenRouter): FAIL (429 rate limited, cooldown ${Math.ceil(cooldownMs / 1000)}s)`;
-        }
-
+        if (r.status === 429) return "Text AI (OpenRouter): FAIL (429 rate limited)";
         return `Text AI (OpenRouter): FAIL (${r.status})`;
     } catch {
         if (stopRequested) return "Text AI (OpenRouter): STOPPED";
@@ -1301,13 +2041,8 @@ async function testOpenAICompatibleConnection() {
     const endpoint = normalizeCompatibleEndpoint(cfg.endpoint);
 
     try {
-        const headers = {
-            "Content-Type": "application/json"
-        };
-
-        if (cfg.apiKey) {
-            headers.Authorization = `Bearer ${cfg.apiKey}`;
-        }
+        const headers = { "Content-Type": "application/json" };
+        if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
 
         const r = await makeRequest({
             method: "POST",
@@ -1366,11 +2101,44 @@ async function runConnectionTest() {
 
     results.push(await testComfyUIImageBlobLoad());
     results.push(STATE.activeWorkflow ? "Workflow: Loaded" : "Workflow: Not loaded");
+
+    const mem = getGameMemory();
+    const charCount = Object.values(mem.characters).length;
+    const factionCount = Object.values(mem.factions).length;
+
+    results.push(`Campaign Codex: ${STATE.visualMemory.enabled ? "ON" : "OFF"} (${charCount} characters, ${factionCount} factions)`);
+    results.push(`Game ID: ${getGameId()}`);
+
     alert(results.join("\n"));
+}
+
+function startScript() {
+    stopRequested = false;
+
+    const stopBtn = $("#" + STOP_BTN_ID);
+    if (stopBtn) {
+        stopBtn.textContent = "STOP";
+        stopBtn.disabled = false;
+        stopBtn.style.opacity = "";
+        stopBtn.style.cursor = "";
+    }
+
+    if (!observer) {
+        observer = new MutationObserver(() => {
+            scheduleProcess(500);
+        });
+    }
+
+    try {
+        observer.observe(document.body, { childList: true, subtree: true });
+    } catch {}
+
+    scheduleProcess(100);
 }
 
 function openModal() {
     let m = $("#" + MODAL_ID);
+
     if (m) {
         m.style.display = "flex";
         return;
@@ -1455,6 +2223,73 @@ function openModal() {
     styleSection(textAISection);
     renderTextAISection(textAISection);
 
+    const codexSection = document.createElement("div");
+    styleSection(codexSection);
+
+    const codexTitle = document.createElement("div");
+    codexTitle.textContent = "Campaign Codex";
+    Object.assign(codexTitle.style, {
+        fontSize: "15px",
+        fontWeight: "700",
+        marginBottom: "8px"
+    });
+
+    const codexInfo = document.createElement("div");
+    const mem = getGameMemory();
+    const charCount = Object.values(mem.characters).length;
+    const factionCount = Object.values(mem.factions).length;
+
+    codexInfo.textContent = `Game ${getGameId()} | ${charCount} characters | ${factionCount} factions | automatic when Text AI is enabled`;
+    Object.assign(codexInfo.style, {
+        opacity: "0.85",
+        marginBottom: "10px",
+        lineHeight: "1.4"
+    });
+
+    const codexToggleLabel = document.createElement("label");
+    Object.assign(codexToggleLabel.style, {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        marginBottom: "10px",
+        cursor: "pointer"
+    });
+
+    const codexToggle = document.createElement("input");
+    codexToggle.type = "checkbox";
+    codexToggle.checked = !!STATE.visualMemory.enabled;
+
+    const codexToggleText = document.createElement("span");
+    codexToggleText.textContent = "Use Campaign Codex for visual consistency";
+
+    codexToggleLabel.appendChild(codexToggle);
+    codexToggleLabel.appendChild(codexToggleText);
+
+    const codexBtns = document.createElement("div");
+    Object.assign(codexBtns.style, {
+        display: "flex",
+        gap: "8px",
+        flexWrap: "wrap"
+    });
+
+    const openCodexBtn = document.createElement("button");
+    openCodexBtn.type = "button";
+    openCodexBtn.textContent = "Open Campaign Codex";
+    styleButton(openCodexBtn, "gold");
+
+    const clearCacheBtn = document.createElement("button");
+    clearCacheBtn.type = "button";
+    clearCacheBtn.textContent = "Clear Prompt Cache";
+    styleButton(clearCacheBtn, "muted");
+
+    codexBtns.appendChild(openCodexBtn);
+    codexBtns.appendChild(clearCacheBtn);
+
+    codexSection.appendChild(codexTitle);
+    codexSection.appendChild(codexInfo);
+    codexSection.appendChild(codexToggleLabel);
+    codexSection.appendChild(codexBtns);
+
     const wfSection = document.createElement("div");
     styleSection(wfSection);
 
@@ -1512,16 +2347,17 @@ function openModal() {
         flexWrap: "wrap"
     });
 
+    const start = document.createElement("button");
+    start.type = "button";
+    start.id = START_BTN_ID;
+    start.textContent = "START";
+    styleButton(start, "start");
+
     const stop = document.createElement("button");
     stop.type = "button";
     stop.id = STOP_BTN_ID;
     stop.textContent = stopRequested ? "STOPPED" : "STOP";
     styleButton(stop, "danger");
-
-    const resume = document.createElement("button");
-    resume.type = "button";
-    resume.textContent = "Resume";
-    styleButton(resume, "muted");
 
     const test = document.createElement("button");
     test.type = "button";
@@ -1533,14 +2369,15 @@ function openModal() {
     close.textContent = "Close";
     styleButton(close);
 
+    bottom.appendChild(start);
     bottom.appendChild(stop);
-    bottom.appendChild(resume);
     bottom.appendChild(test);
     bottom.appendChild(close);
 
     box.appendChild(header);
     box.appendChild(general);
     box.appendChild(textAISection);
+    box.appendChild(codexSection);
     box.appendChild(wfSection);
     box.appendChild(bottom);
 
@@ -1560,11 +2397,26 @@ function openModal() {
         save();
     };
 
+    codexToggle.onchange = e => {
+        STATE.visualMemory.enabled = !!e.target.checked;
+        save();
+    };
+
+    openCodexBtn.onclick = () => openCodex();
+
+    clearCacheBtn.onclick = () => {
+        const fresh = getGameMemory();
+        fresh.promptCache = {};
+        save();
+        alert("Prompt cache cleared for this game.");
+    };
+
     wfUpload.onchange = e => {
         const f = e.target.files[0];
         if (!f) return;
 
         const r = new FileReader();
+
         r.onload = () => {
             try {
                 STATE.workflows[f.name] = JSON.parse(r.result);
@@ -1576,6 +2428,7 @@ function openModal() {
                 alert("Workflow error");
             }
         };
+
         r.readAsText(f);
     };
 
@@ -1589,28 +2442,120 @@ function openModal() {
         const name = wfSelect.value;
         if (!name) return;
 
-        try {
-            delete STATE.workflows[name];
-            if (STATE.activeWorkflow === name) STATE.activeWorkflow = null;
-            save();
-            renderWorkflowList(wfSelect, wfStatus, wfDelete);
-        } catch {}
+        delete STATE.workflows[name];
+        if (STATE.activeWorkflow === name) STATE.activeWorkflow = null;
+
+        save();
+        renderWorkflowList(wfSelect, wfStatus, wfDelete);
     };
 
-    stop.onclick = () => {
-        stopAllRequests();
-    };
-
-    resume.onclick = () => {
-        resetStopState();
-        scheduleProcess(100);
-    };
-
-    test.onclick = () => {
-        runConnectionTest();
-    };
-
+    start.onclick = () => startScript();
+    stop.onclick = () => stopAllRequests();
+    test.onclick = () => runConnectionTest();
     close.onclick = () => m.remove();
+}
+
+function stopAllRequests() {
+    stopRequested = true;
+
+    for (const req of Array.from(activeRequests)) {
+        try {
+            req.abort();
+        } catch {}
+    }
+    activeRequests.clear();
+
+    for (const cancel of Array.from(activePollCancels)) {
+        try {
+            cancel();
+        } catch {}
+    }
+    activePollCancels.clear();
+
+    for (const u of Array.from(objectUrls)) {
+        try {
+            URL.revokeObjectURL(u);
+        } catch {}
+    }
+    objectUrls.clear();
+
+    if (observer) {
+        try {
+            observer.disconnect();
+        } catch {}
+    }
+
+    const btn = $("#" + STOP_BTN_ID);
+    if (btn) {
+        btn.textContent = "STOPPED";
+        btn.disabled = true;
+        btn.style.opacity = "0.75";
+        btn.style.cursor = "not-allowed";
+    }
+}
+
+function makeRequest(options) {
+    return new Promise((resolve, reject) => {
+        if (stopRequested) {
+            reject(new Error("stopped"));
+            return;
+        }
+
+        let settled = false;
+        let req = null;
+
+        const cleanup = () => {
+            if (req && typeof req.abort === "function") {
+                activeRequests.delete(req);
+            }
+        };
+
+        const finishResolve = (value) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+        };
+
+        const finishReject = (err) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+        };
+
+        req = GM_xmlhttpRequest({
+            ...options,
+            onload: r => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                if (typeof options.onload === "function") {
+                    try {
+                        const value = options.onload(r);
+                        finishResolve(value === undefined ? r : value);
+                    } catch (e) {
+                        finishReject(e);
+                    }
+                } else {
+                    finishResolve(r);
+                }
+            },
+            onerror: e => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                finishReject(e);
+            },
+            ontimeout: () => {
+                if (stopRequested) return finishReject(new Error("stopped"));
+                finishReject(new Error("timeout"));
+            },
+            onabort: () => {
+                finishReject(new Error("stopped"));
+            }
+        });
+
+        if (req && typeof req.abort === "function") {
+            activeRequests.add(req);
+        }
+    });
 }
 
 function blobFromComfyUrl(url) {
@@ -1626,21 +2571,8 @@ function blobFromComfyUrl(url) {
             responseType: "blob",
             timeout: 20000,
             onload: r => {
-                if (r.status < 200 || r.status >= 300) {
-                    throw new Error(`Image HTTP ${r.status}`);
-                }
-
-                const blob = r.response;
-
-                if (!blob || !String(blob.type || "").startsWith("image/")) {
-                    console.warn("ComfyUI image response was not an image blob:", {
-                        status: r.status,
-                        contentType: blob?.type,
-                        url
-                    });
-                }
-
-                return blob;
+                if (r.status < 200 || r.status >= 300) throw new Error(`Image HTTP ${r.status}`);
+                return r.response;
             }
         }).then(resolve).catch(reject);
     });
@@ -1661,10 +2593,8 @@ function loadImageWithRetry(img, url, preview) {
             if (stopRequested) return;
 
             if (lastObjectUrl) {
-                try {
-                    URL.revokeObjectURL(lastObjectUrl);
-                    objectUrls.delete(lastObjectUrl);
-                } catch {}
+                URL.revokeObjectURL(lastObjectUrl);
+                objectUrls.delete(lastObjectUrl);
             }
 
             const objectUrl = URL.createObjectURL(blob);
@@ -1741,6 +2671,7 @@ async function process() {
             if (stopRequested) return;
 
             const wf = buildWorkflow(refined);
+
             if (!wf) {
                 preview.innerHTML = "Failed to build image prompt";
                 continue;
@@ -1751,12 +2682,14 @@ async function process() {
                 if (stopRequested) return;
 
                 const promptId = res?.prompt_id;
+
                 if (!promptId) {
                     preview.innerHTML = "Image request accepted, but no prompt id returned";
                     continue;
                 }
 
                 let url = null;
+
                 try {
                     url = await pollResult(promptId);
                 } catch (err) {
@@ -1791,6 +2724,7 @@ async function process() {
             } catch (err) {
                 if (stopRequested) return;
                 console.warn("Image generation request failed:", err);
+
                 if (!preview.querySelector("img")) {
                     preview.innerHTML = "Failed to generate image";
                 }
@@ -1818,6 +2752,30 @@ function scheduleProcess(delay = 500) {
         processTimer = null;
         process();
     }, delay);
+}
+
+function startScript() {
+    stopRequested = false;
+
+    const stopBtn = $("#" + STOP_BTN_ID);
+    if (stopBtn) {
+        stopBtn.textContent = "STOP";
+        stopBtn.disabled = false;
+        stopBtn.style.opacity = "";
+        stopBtn.style.cursor = "";
+    }
+
+    if (!observer) {
+        observer = new MutationObserver(() => {
+            scheduleProcess(500);
+        });
+    }
+
+    try {
+        observer.observe(document.body, { childList: true, subtree: true });
+    } catch {}
+
+    scheduleProcess(100);
 }
 
 observer = new MutationObserver(() => {
